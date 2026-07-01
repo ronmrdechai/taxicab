@@ -8,6 +8,7 @@ from .data import PricePoint
 
 
 FREQUENCIES = {
+    "daily": 252,
     "monthly": 12,
     "quarterly": 4,
     "half-yearly": 2,
@@ -62,6 +63,8 @@ def beta_to_benchmark(asset_returns: Dict[date, float], benchmark_returns: Dict[
 
 
 def period_key(day: date, frequency: str) -> Tuple[int, int]:
+    if frequency == "daily":
+        return day.toordinal(), 0
     if frequency == "monthly":
         return day.year, day.month
     if frequency == "quarterly":

@@ -7,11 +7,8 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 import numpy as np
-
-try:
-    from tqdm.auto import tqdm
-except ImportError:  # pragma: no cover - dependency fallback
-    tqdm = None
+from scipy.optimize import minimize
+from tqdm.auto import tqdm
 
 from .data import Holding, PricePoint, sector_targets
 from .metrics import (
@@ -36,6 +33,7 @@ class Candidate:
     gross_harvestable_loss_rate: float = 0.0
     observations: int = 0
     returns: Optional[Dict[date, float]] = None
+    industry: str = "Unknown"
 
 
 @dataclass(frozen=True)
@@ -51,6 +49,7 @@ class TrackingModel:
 class SimulatedHarvestLot:
     ticker: str
     sector: str
+    industry: str
     shares: float
     basis: float
     purchase_day: date
@@ -67,12 +66,14 @@ def build_candidates(
     harvest_threshold_pct: float = 0.05,
     transaction_cost_bps: float = 5.0,
     replacement_cost_bps: float = 10.0,
+    harvest_frequency: Optional[str] = None,
 ) -> List[Candidate]:
     if tax_metric not in {"simulated", "gross"}:
         raise ValueError("tax_metric must be simulated or gross")
     if benchmark_ticker not in prices:
         raise ValueError(f"benchmark prices missing for {benchmark_ticker}")
     benchmark_returns = daily_returns(prices[benchmark_ticker])
+    tax_frequency = harvest_frequency or rebalance_frequency
 
     candidates: List[Candidate] = []
     for holding in holdings:
@@ -82,10 +83,10 @@ def build_candidates(
         overlap = observations_overlap(asset_returns, benchmark_returns)
         if overlap < min_observations:
             continue
-        gross = estimated_tax_loss_alpha(prices[holding.ticker], rebalance_frequency)
+        gross = estimated_tax_loss_alpha(prices[holding.ticker], tax_frequency)
         simulated = simulated_tax_alpha(
             prices[holding.ticker],
-            rebalance_frequency,
+            tax_frequency,
             tax_rate=tax_rate,
             harvest_threshold_pct=harvest_threshold_pct,
             transaction_cost_bps=transaction_cost_bps,
@@ -96,6 +97,7 @@ def build_candidates(
                 ticker=holding.ticker,
                 index_weight=holding.weight,
                 sector=holding.sector or "Unknown",
+                industry=holding.industry or "Unknown",
                 beta=beta_to_benchmark(asset_returns, benchmark_returns),
                 tax_alpha=simulated if tax_metric == "simulated" else gross,
                 simulated_tax_alpha=simulated,
@@ -316,7 +318,7 @@ def _sector_exposure_arrays(
 
 def _progress_range(total: int, label: str, show_progress: bool) -> Iterable[int]:
     values = range(total)
-    if show_progress and tqdm is not None and total > 0:
+    if show_progress and total > 0:
         return tqdm(values, total=total, desc=label, unit="iter")
     return values
 
@@ -585,32 +587,97 @@ def optimize_weights(
     if tracking_model is None:
         raise ValueError("benchmark returns and candidate returns are required to optimize error margin")
     tracking_error_scale = max(error_margin, 0.005) ** 2
+    max_iterations = max(0, iterations)
 
-    for step_index in _progress_range(iterations, progress_label, show_progress):
-        tax_alpha = float(weights_array @ tax_values)
+    if max_iterations <= 0:
+        return weights_array.tolist()
+
+    def objective(weights: np.ndarray) -> float:
+        tax_alpha = float(weights @ tax_values)
         tax_delta = tax_alpha - target_tax_alpha
         if tax_alpha_mode == "at-least":
             tax_delta = min(tax_delta, 0.0)
-        tax_residual = tax_delta / (tax_scale**2)
-        active_gradient = np.asarray(_active_variance_gradient(weights_array, tracking_model), dtype=float)
-        gradient = tracking_error_penalty * tracking_model.annualization * active_gradient / tracking_error_scale
-        gradient += 2.0 * tax_penalty * tax_residual * tax_values
-        if sector_matrix is not None and target_sector_values is not None:
-            sector_residual = sector_matrix @ weights_array - target_sector_values
-            gradient += 2.0 * sector_penalty * (sector_matrix.T @ sector_residual)
-        gradient += 2.0 * concentration_penalty * weights_array
-        gradient += 2.0 * index_anchor_penalty * (weights_array - anchor_weights_array)
-        step = learning_rate / math.sqrt(1.0 + step_index / 25.0)
-        weights_array = _project_to_bounded_simplex_array(
-            weights_array - step * gradient,
-            lower=min_weight,
-            upper=max_weight_for_projection,
+        value = (
+            tracking_error_penalty
+            * tracking_model.annualization
+            * _active_variance(weights, tracking_model)
+            / tracking_error_scale
         )
-        if tracking_error(weights_array, tracking_model) > error_margin:
-            weights_array = np.asarray(
-                _repair_tracking_error(weights_array, anchor_weights_array, tracking_model, error_margin),
-                dtype=float,
-            )
+        value += tax_penalty * (tax_delta / tax_scale) ** 2
+        if sector_matrix is not None and target_sector_values is not None:
+            sector_residual = sector_matrix @ weights - target_sector_values
+            value += sector_penalty * float(sector_residual @ sector_residual)
+        value += concentration_penalty * float(weights @ weights)
+        value += index_anchor_penalty * float((weights - anchor_weights_array) @ (weights - anchor_weights_array))
+        return float(value)
+
+    def objective_gradient(weights: np.ndarray) -> np.ndarray:
+        tax_alpha = float(weights @ tax_values)
+        tax_delta = tax_alpha - target_tax_alpha
+        if tax_alpha_mode == "at-least":
+            tax_delta = min(tax_delta, 0.0)
+        active_gradient = np.asarray(_active_variance_gradient(weights, tracking_model), dtype=float)
+        gradient = tracking_error_penalty * tracking_model.annualization * active_gradient / tracking_error_scale
+        if tax_delta != 0.0:
+            gradient += 2.0 * tax_penalty * tax_delta * tax_values / (tax_scale**2)
+        if sector_matrix is not None and target_sector_values is not None:
+            sector_residual = sector_matrix @ weights - target_sector_values
+            gradient += 2.0 * sector_penalty * (sector_matrix.T @ sector_residual)
+        gradient += 2.0 * concentration_penalty * weights
+        gradient += 2.0 * index_anchor_penalty * (weights - anchor_weights_array)
+        return gradient
+
+    def tracking_constraint(weights: np.ndarray) -> float:
+        return error_margin**2 - tracking_model.annualization * _active_variance(weights, tracking_model)
+
+    def tracking_constraint_gradient(weights: np.ndarray) -> np.ndarray:
+        active_gradient = np.asarray(_active_variance_gradient(weights, tracking_model), dtype=float)
+        return -tracking_model.annualization * active_gradient
+
+    progress_bar = tqdm(total=max_iterations, desc=progress_label, unit="iter") if show_progress else None
+
+    def update_progress(_weights: np.ndarray) -> None:
+        if progress_bar is not None:
+            progress_bar.update(1)
+
+    try:
+        result = minimize(
+            objective,
+            weights_array,
+            method="SLSQP",
+            jac=objective_gradient,
+            bounds=[(min_weight, max_weight_for_projection)] * len(candidates),
+            constraints=[
+                {
+                    "type": "eq",
+                    "fun": lambda weights: float(np.sum(weights) - 1.0),
+                    "jac": lambda weights: np.ones_like(weights),
+                },
+                {
+                    "type": "ineq",
+                    "fun": tracking_constraint,
+                    "jac": tracking_constraint_gradient,
+                },
+            ],
+            callback=update_progress if progress_bar is not None else None,
+            options={"maxiter": max_iterations, "ftol": 1e-12, "disp": False},
+        )
+    finally:
+        if progress_bar is not None:
+            progress_bar.close()
+
+    if result.x is not None and len(result.x) == len(candidates) and np.all(np.isfinite(result.x)):
+        weights_array = np.asarray(result.x, dtype=float)
+
+    weights_array = _project_to_bounded_simplex_array(
+        weights_array,
+        lower=min_weight,
+        upper=max_weight_for_projection,
+    )
+    if tracking_error(weights_array, tracking_model) > error_margin + 1e-8:
+        repaired = _repair_tracking_error(weights_array, anchor_weights_array, tracking_model, error_margin)
+        if tracking_error(repaired, tracking_model) <= error_margin + 1e-8:
+            weights_array = np.asarray(repaired, dtype=float)
     return weights_array.tolist()
 
 
@@ -645,6 +712,46 @@ def sector_error(sectors: Dict[str, float], targets: Dict[str, float]) -> float:
     return sum(abs(sectors.get(sector, 0.0) - targets.get(sector, 0.0)) for sector in set(sectors).union(targets))
 
 
+def _return_correlation(
+    left: Optional[Mapping[date, float]],
+    right: Optional[Mapping[date, float]],
+) -> float:
+    if not left or not right:
+        return 0.0
+    dates = sorted(set(left).intersection(right))
+    if len(dates) < 2:
+        return 0.0
+    left_values = [float(left[day]) for day in dates]
+    right_values = [float(right[day]) for day in dates]
+    left_mean = sum(left_values) / len(left_values)
+    right_mean = sum(right_values) / len(right_values)
+    covariance_value = sum((x - left_mean) * (y - right_mean) for x, y in zip(left_values, right_values))
+    left_variance = sum((x - left_mean) ** 2 for x in left_values)
+    right_variance = sum((y - right_mean) ** 2 for y in right_values)
+    denominator = math.sqrt(left_variance * right_variance)
+    if denominator <= 0:
+        return 0.0
+    return max(min(covariance_value / denominator, 1.0), -1.0)
+
+
+def _replacement_similarity(source: Candidate, replacement: Candidate) -> Dict[str, float]:
+    same_industry = (
+        source.industry != "Unknown"
+        and replacement.industry != "Unknown"
+        and source.industry == replacement.industry
+    )
+    correlation = _return_correlation(source.returns, replacement.returns)
+    beta_delta = abs(source.beta - replacement.beta)
+    industry_penalty = 0.0 if same_industry else 1.0
+    score = 3.0 * industry_penalty + beta_delta + (1.0 - correlation)
+    return {
+        "score": score,
+        "correlation": correlation,
+        "beta_delta": beta_delta,
+        "industry_match": 1.0 if same_industry else 0.0,
+    }
+
+
 def replacement_candidates(
     universe: Sequence[Candidate],
     selected: Sequence[Candidate],
@@ -677,31 +784,49 @@ def replacement_candidates(
         pool = sorted(
             by_sector.get(candidate.sector, []),
             key=lambda item: (
+                _replacement_similarity(candidate, item)["score"],
                 score_candidate(item),
                 -item.index_weight,
             ),
         )
         replacements[candidate.ticker] = [
-            {
-                "ticker": item.ticker,
-                "sector": item.sector,
-                "index_weight": item.index_weight,
-                "beta": item.beta,
-                "tax_alpha": item.tax_alpha,
-                "simulated_tax_alpha": item.simulated_tax_alpha,
-                "gross_harvestable_loss_rate": item.gross_harvestable_loss_rate,
-                "estimated_tax_loss_alpha": item.tax_alpha,
-            }
+            _replacement_row(candidate, item)
             for item in pool[:limit]
         ]
     return replacements
 
 
-def _empty_harvest_simulation(reason: str, frequency: str) -> Dict[str, object]:
+def _replacement_row(source: Candidate, replacement: Candidate) -> Dict[str, object]:
+    similarity = _replacement_similarity(source, replacement)
+    return {
+        "ticker": replacement.ticker,
+        "sector": replacement.sector,
+        "industry": replacement.industry,
+        "index_weight": replacement.index_weight,
+        "beta": replacement.beta,
+        "beta_delta": similarity["beta_delta"],
+        "return_correlation": similarity["correlation"],
+        "industry_match": bool(similarity["industry_match"]),
+        "replacement_score": similarity["score"],
+        "tax_alpha": replacement.tax_alpha,
+        "simulated_tax_alpha": replacement.simulated_tax_alpha,
+        "gross_harvestable_loss_rate": replacement.gross_harvestable_loss_rate,
+        "estimated_tax_loss_alpha": replacement.tax_alpha,
+    }
+
+
+def _empty_harvest_simulation(
+    reason: str,
+    rebalance_frequency: str,
+    harvest_frequency: Optional[str] = None,
+) -> Dict[str, object]:
+    tax_frequency = harvest_frequency or rebalance_frequency
     return {
         "status": "skipped",
         "reason": reason,
-        "frequency": frequency,
+        "frequency": tax_frequency,
+        "rebalance_frequency": rebalance_frequency,
+        "harvest_frequency": tax_frequency,
         "start": None,
         "end": None,
         "years": 0.0,
@@ -715,11 +840,88 @@ def _empty_harvest_simulation(reason: str, frequency: str) -> Dict[str, object]:
         "total_replacement_cost": 0.0,
         "total_net_tax_benefit": 0.0,
         "portfolio_simulated_tax_alpha": 0.0,
+        "portfolio_harvest_annualized_return": 0.0,
+        "benchmark_annualized_return": 0.0,
+        "portfolio_harvest_active_return": 0.0,
+        "portfolio_harvest_tracking_error": 0.0,
+        "portfolio_harvest_beta": 0.0,
+        "portfolio_harvest_correlation": 0.0,
+        "portfolio_harvest_observations": 0,
         "harvest_count": 0,
+        "rebalance_count": 0,
+        "rebalance_dates": [],
         "skipped_no_replacement": 0,
         "skipped_nonpositive_net_benefit": 0,
         "period_realized_losses": [],
         "sample_events": [],
+    }
+
+
+def _series_returns(values: Sequence[float]) -> List[float]:
+    returns: List[float] = []
+    for previous, current in zip(values, values[1:]):
+        if previous > 0 and current > 0:
+            returns.append(current / previous - 1.0)
+    return returns
+
+
+def _sample_variance(values: Sequence[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    average = sum(values) / len(values)
+    return sum((value - average) ** 2 for value in values) / (len(values) - 1)
+
+
+def _sample_covariance(left: Sequence[float], right: Sequence[float]) -> float:
+    if len(left) != len(right):
+        raise ValueError("series lengths must match")
+    if len(left) < 2:
+        return 0.0
+    left_average = sum(left) / len(left)
+    right_average = sum(right) / len(right)
+    return sum(
+        (left_value - left_average) * (right_value - right_average)
+        for left_value, right_value in zip(left, right)
+    ) / (len(left) - 1)
+
+
+def _annualized_return(values: Sequence[float], years: float) -> float:
+    if len(values) < 2 or values[0] <= 0 or values[-1] <= 0 or years <= 0:
+        return 0.0
+    return (values[-1] / values[0]) ** (1.0 / years) - 1.0
+
+
+def _harvest_path_metrics(
+    portfolio_values: Sequence[float],
+    benchmark_values: Sequence[float],
+    years: float,
+    harvest_frequency: str,
+) -> Dict[str, object]:
+    portfolio_returns = _series_returns(portfolio_values)
+    benchmark_returns = _series_returns(benchmark_values)
+    observation_count = min(len(portfolio_returns), len(benchmark_returns))
+    portfolio_returns = portfolio_returns[:observation_count]
+    benchmark_returns = benchmark_returns[:observation_count]
+    active_returns = [
+        portfolio_return - benchmark_return
+        for portfolio_return, benchmark_return in zip(portfolio_returns, benchmark_returns)
+    ]
+    periods_per_year = FREQUENCIES[harvest_frequency]
+    active_mean = sum(active_returns) / len(active_returns) if active_returns else 0.0
+    active_variance = _sample_variance(active_returns)
+    benchmark_variance = _sample_variance(benchmark_returns)
+    portfolio_variance = _sample_variance(portfolio_returns)
+    covariance = _sample_covariance(portfolio_returns, benchmark_returns) if observation_count >= 2 else 0.0
+    correlation_denominator = math.sqrt(portfolio_variance * benchmark_variance)
+
+    return {
+        "portfolio_harvest_annualized_return": _annualized_return(portfolio_values, years),
+        "benchmark_annualized_return": _annualized_return(benchmark_values, years),
+        "portfolio_harvest_active_return": active_mean * periods_per_year,
+        "portfolio_harvest_tracking_error": math.sqrt(max(active_variance, 0.0) * periods_per_year),
+        "portfolio_harvest_beta": covariance / benchmark_variance if benchmark_variance > 0 else 0.0,
+        "portfolio_harvest_correlation": covariance / correlation_denominator if correlation_denominator > 0 else 0.0,
+        "portfolio_harvest_observations": observation_count,
     }
 
 
@@ -753,14 +955,54 @@ def _price_table(
     return table
 
 
+def _cached_replacement_similarity(
+    source: Candidate,
+    replacement: Candidate,
+    cache: Dict[Tuple[str, str], Dict[str, float]],
+) -> Dict[str, float]:
+    key = (source.ticker, replacement.ticker)
+    if key not in cache:
+        cache[key] = _replacement_similarity(source, replacement)
+    return cache[key]
+
+
+def _active_historical_holdings(
+    historical_holdings: Optional[Mapping[date, Sequence[Holding]]],
+    day: date,
+) -> Optional[Sequence[Holding]]:
+    if not historical_holdings:
+        return None
+    active_day = None
+    for snapshot_day in sorted(historical_holdings):
+        if snapshot_day <= day:
+            active_day = snapshot_day
+        else:
+            break
+    if active_day is None:
+        return []
+    return historical_holdings[active_day]
+
+
+def _active_historical_tickers(
+    historical_holdings: Optional[Mapping[date, Sequence[Holding]]],
+    day: date,
+) -> Optional[Set[str]]:
+    active = _active_historical_holdings(historical_holdings, day)
+    if active is None:
+        return None
+    return {holding.ticker for holding in active}
+
+
 def _same_sector_replacements(
     universe: Sequence[Candidate],
-    sector: str,
+    source: Candidate,
     unavailable: Set[str],
     price_table: Mapping[str, Mapping[date, float]],
     day: date,
     candidate_scores: Mapping[str, float],
+    replacement_scores: Dict[Tuple[str, str], Dict[str, float]],
     replacement_count: int,
+    active_tickers: Optional[Set[str]] = None,
 ) -> List[Candidate]:
     if replacement_count <= 0:
         return []
@@ -768,12 +1010,14 @@ def _same_sector_replacements(
     pool = [
         candidate
         for candidate in universe
-        if candidate.sector == sector
+        if candidate.sector == source.sector
         and candidate.ticker not in unavailable_upper
+        and (active_tickers is None or candidate.ticker in active_tickers)
         and price_table.get(candidate.ticker, {}).get(day, 0.0) > 0
     ]
     pool.sort(
         key=lambda candidate: (
+            _cached_replacement_similarity(source, candidate, replacement_scores)["score"],
             candidate_scores.get(candidate.ticker, float("inf")),
             -candidate.index_weight,
             candidate.ticker,
@@ -795,6 +1039,99 @@ def _replacement_allocations(replacements: Sequence[Candidate], value: float) ->
     return [(candidate, equal_value) for candidate in replacements]
 
 
+def _rebalance_lots_to_targets(
+    lots: Sequence[SimulatedHarvestLot],
+    selected_pairs: Sequence[Tuple[Candidate, float]],
+    price_table: Mapping[str, Mapping[date, float]],
+    day: date,
+    banned_until: Mapping[str, date],
+    active_tickers: Optional[Set[str]],
+) -> Tuple[List[SimulatedHarvestLot], bool]:
+    if not lots or not selected_pairs:
+        return list(lots), False
+
+    lot_values: List[Tuple[SimulatedHarvestLot, float, float]] = []
+    portfolio_value = 0.0
+    for lot in lots:
+        price = price_table.get(lot.ticker, {}).get(day)
+        if price is None or price <= 0:
+            return list(lots), False
+        market_value = lot.shares * price
+        lot_values.append((lot, price, market_value))
+        portfolio_value += market_value
+    if portfolio_value <= 0:
+        return list(lots), False
+
+    available_targets: List[Tuple[Candidate, float]] = []
+    for candidate, weight in selected_pairs:
+        is_banned = banned_until.get(candidate.ticker, date.min) >= day
+        is_active = active_tickers is None or candidate.ticker in active_tickers
+        has_price = price_table.get(candidate.ticker, {}).get(day, 0.0) > 0
+        if is_banned or not is_active or not has_price:
+            return list(lots), False
+        available_targets.append((candidate, weight))
+
+    target_weight_total = sum(weight for _, weight in available_targets)
+    if target_weight_total <= 0:
+        return list(lots), False
+
+    target_values = {
+        candidate.ticker: portfolio_value * weight / target_weight_total
+        for candidate, weight in available_targets
+    }
+    current_values: Dict[str, float] = {}
+    for lot, _, market_value in lot_values:
+        current_values[lot.ticker] = current_values.get(lot.ticker, 0.0) + market_value
+
+    tolerance = portfolio_value * 1e-9
+    changed = False
+    rebalanced: List[SimulatedHarvestLot] = []
+    for lot, _, market_value in lot_values:
+        target_value = target_values.get(lot.ticker, 0.0)
+        current_value = current_values.get(lot.ticker, 0.0)
+        if current_value <= 0 or target_value <= 0:
+            changed = changed or market_value > tolerance
+            continue
+        keep_ratio = min(target_value / current_value, 1.0)
+        if keep_ratio < 1.0 - 1e-9:
+            changed = True
+        kept_shares = lot.shares * keep_ratio
+        kept_basis = lot.basis * keep_ratio
+        if kept_shares > 0 and kept_basis > 0:
+            rebalanced.append(
+                SimulatedHarvestLot(
+                    ticker=lot.ticker,
+                    sector=lot.sector,
+                    industry=lot.industry,
+                    shares=kept_shares,
+                    basis=kept_basis,
+                    purchase_day=lot.purchase_day,
+                )
+            )
+
+    candidate_by_ticker = {candidate.ticker: candidate for candidate, _ in available_targets}
+    for ticker, target_value in target_values.items():
+        current_value = min(current_values.get(ticker, 0.0), target_value)
+        buy_value = target_value - current_value
+        if buy_value <= tolerance:
+            continue
+        candidate = candidate_by_ticker[ticker]
+        price = price_table[candidate.ticker][day]
+        rebalanced.append(
+            SimulatedHarvestLot(
+                ticker=candidate.ticker,
+                sector=candidate.sector,
+                industry=candidate.industry,
+                shares=buy_value / price,
+                basis=buy_value,
+                purchase_day=day,
+            )
+        )
+        changed = True
+
+    return rebalanced, changed
+
+
 def simulate_portfolio_harvests(
     selected: Sequence[Candidate],
     weights: Sequence[float],
@@ -813,12 +1150,17 @@ def simulate_portfolio_harvests(
     replacement_count: int = 2,
     wash_sale_days: int = 31,
     sample_event_limit: int = 20,
+    historical_holdings: Optional[Mapping[date, Sequence[Holding]]] = None,
+    harvest_frequency: Optional[str] = None,
 ) -> Dict[str, object]:
+    tax_frequency = harvest_frequency or rebalance_frequency
     benchmark_points = prices.get(benchmark_ticker)
     if not benchmark_points:
-        return _empty_harvest_simulation("benchmark prices are missing", rebalance_frequency)
+        return _empty_harvest_simulation("benchmark prices are missing", rebalance_frequency, tax_frequency)
     if rebalance_frequency not in FREQUENCIES:
-        return _empty_harvest_simulation("unsupported rebalance frequency", rebalance_frequency)
+        return _empty_harvest_simulation("unsupported rebalance frequency", rebalance_frequency, tax_frequency)
+    if tax_frequency not in FREQUENCIES:
+        return _empty_harvest_simulation("unsupported harvest frequency", rebalance_frequency, tax_frequency)
     if len(selected) != len(weights):
         raise ValueError("selected candidates and weights must have the same length")
     if tax_rate < 0:
@@ -830,9 +1172,11 @@ def simulate_portfolio_harvests(
     if wash_sale_days < 0:
         raise ValueError("wash_sale_days must be nonnegative")
 
-    schedule = [point.day for point in period_end_points(benchmark_points, rebalance_frequency)]
+    harvest_days = {point.day for point in period_end_points(benchmark_points, tax_frequency)}
+    rebalance_days = {point.day for point in period_end_points(benchmark_points, rebalance_frequency)}
+    schedule = sorted(harvest_days.union(rebalance_days))
     if len(schedule) < 2:
-        return _empty_harvest_simulation("not enough rebalance dates", rebalance_frequency)
+        return _empty_harvest_simulation("not enough harvest dates", rebalance_frequency, tax_frequency)
 
     tickers = {candidate.ticker for candidate in universe}.union(candidate.ticker for candidate in selected)
     table = _price_table(tickers, prices, schedule)
@@ -846,21 +1190,29 @@ def simulate_portfolio_harvests(
         )
         for candidate in universe
     }
+    candidate_by_ticker = {candidate.ticker: candidate for candidate in universe}
+    replacement_scores: Dict[Tuple[str, str], Dict[str, float]] = {}
     selected_pairs = [
         (candidate, max(0.0, weight))
         for candidate, weight in zip(selected, weights)
         if weight > 0
     ]
     if not selected_pairs:
-        return _empty_harvest_simulation("portfolio has no positive weights", rebalance_frequency)
+        return _empty_harvest_simulation("portfolio has no positive weights", rebalance_frequency, tax_frequency)
 
     start_day = None
     for day in schedule:
-        if all(table.get(candidate.ticker, {}).get(day, 0.0) > 0 for candidate, _ in selected_pairs):
+        active_tickers = _active_historical_tickers(historical_holdings, day)
+        selected_are_active = active_tickers is None or all(candidate.ticker in active_tickers for candidate, _ in selected_pairs)
+        if selected_are_active and all(table.get(candidate.ticker, {}).get(day, 0.0) > 0 for candidate, _ in selected_pairs):
             start_day = day
             break
     if start_day is None:
-        return _empty_harvest_simulation("selected positions do not share a priced start date", rebalance_frequency)
+        return _empty_harvest_simulation(
+            "selected positions do not share a priced start date",
+            rebalance_frequency,
+            tax_frequency,
+        )
 
     total_weight = sum(weight for _, weight in selected_pairs)
     lots: List[SimulatedHarvestLot] = []
@@ -871,6 +1223,7 @@ def simulate_portfolio_harvests(
             SimulatedHarvestLot(
                 ticker=candidate.ticker,
                 sector=candidate.sector,
+                industry=candidate.industry,
                 shares=allocation / price,
                 basis=allocation,
                 purchase_day=start_day,
@@ -885,12 +1238,14 @@ def simulate_portfolio_harvests(
     total_transaction_cost = 0.0
     total_replacement_cost = 0.0
     harvest_count = 0
+    rebalance_count = 0
     skipped_no_replacement = 0
     skipped_nonpositive_net_benefit = 0
     banned_until: Dict[str, date] = {}
     portfolio_values: List[float] = []
     period_rows: Dict[date, Dict[str, float]] = {}
     sample_events: List[Dict[str, object]] = []
+    rebalance_dates: List[str] = []
 
     for day_index, day in enumerate(simulation_dates):
         portfolio_value = 0.0
@@ -903,127 +1258,163 @@ def simulate_portfolio_harvests(
         if day_index == 0:
             continue
 
-        next_lots: List[SimulatedHarvestLot] = []
-        sold_this_period: Set[str] = set()
-        for lot_index, lot in enumerate(lots):
-            price = table.get(lot.ticker, {}).get(day)
-            if price is None or price <= 0 or lot.basis <= 0:
-                next_lots.append(lot)
-                continue
-            market_value = lot.shares * price
-            unrealized_return = market_value / lot.basis - 1.0
-            realized_loss = lot.basis - market_value
-            if unrealized_return > -harvest_threshold_pct or realized_loss <= 0:
-                next_lots.append(lot)
-                continue
+        pit_active_tickers = _active_historical_tickers(historical_holdings, day)
+        if day in harvest_days:
+            next_lots: List[SimulatedHarvestLot] = []
+            next_lot_tickers: Set[str] = set()
+            lot_tickers = {lot.ticker for lot in lots}
+            sold_this_period: Set[str] = set()
+            for lot in lots:
+                price = table.get(lot.ticker, {}).get(day)
+                if price is None or price <= 0 or lot.basis <= 0:
+                    next_lots.append(lot)
+                    next_lot_tickers.add(lot.ticker)
+                    continue
+                market_value = lot.shares * price
+                unrealized_return = market_value / lot.basis - 1.0
+                realized_loss = lot.basis - market_value
+                if unrealized_return > -harvest_threshold_pct or realized_loss <= 0:
+                    next_lots.append(lot)
+                    next_lot_tickers.add(lot.ticker)
+                    continue
 
-            tax_benefit = realized_loss * tax_rate
-            transaction_cost = 2.0 * cost_rate * market_value
-            replacement_cost = replacement_cost_rate * market_value
-            net_tax_benefit = tax_benefit - transaction_cost - replacement_cost
-            if net_tax_benefit <= 0:
-                skipped_nonpositive_net_benefit += 1
-                next_lots.append(lot)
-                continue
+                tax_benefit = realized_loss * tax_rate
+                transaction_cost = 2.0 * cost_rate * market_value
+                replacement_cost = replacement_cost_rate * market_value
+                net_tax_benefit = tax_benefit - transaction_cost - replacement_cost
+                if net_tax_benefit <= 0:
+                    skipped_nonpositive_net_benefit += 1
+                    next_lots.append(lot)
+                    next_lot_tickers.add(lot.ticker)
+                    continue
 
-            active_tickers = {other.ticker for idx, other in enumerate(lots) if idx != lot_index}
-            active_tickers.update(other.ticker for other in next_lots)
-            banned_tickers = {
-                ticker
-                for ticker, banned_day in banned_until.items()
-                if banned_day >= day
-            }
-            unavailable = active_tickers.union(banned_tickers, sold_this_period, {lot.ticker})
-            replacements = _same_sector_replacements(
-                universe,
-                lot.sector,
-                unavailable,
-                table,
-                day,
-                candidate_scores,
-                replacement_count,
-            )
-            if not replacements:
-                relaxed_unavailable = banned_tickers.union(sold_this_period, {lot.ticker})
+                banned_tickers = {
+                    ticker
+                    for ticker, banned_day in banned_until.items()
+                    if banned_day >= day
+                }
+                unavailable = lot_tickers.union(next_lot_tickers, banned_tickers, sold_this_period, {lot.ticker})
+                source_candidate = candidate_by_ticker.get(lot.ticker)
+                if source_candidate is None:
+                    next_lots.append(lot)
+                    next_lot_tickers.add(lot.ticker)
+                    continue
                 replacements = _same_sector_replacements(
                     universe,
-                    lot.sector,
-                    relaxed_unavailable,
+                    source_candidate,
+                    unavailable,
                     table,
                     day,
                     candidate_scores,
+                    replacement_scores,
                     replacement_count,
+                    active_tickers=pit_active_tickers,
                 )
-            allocation_plan: List[Tuple[Candidate, float, float]] = []
-            for replacement, allocation in _replacement_allocations(replacements, market_value):
-                replacement_price = table.get(replacement.ticker, {}).get(day)
-                if replacement_price and replacement_price > 0 and allocation > 0:
-                    allocation_plan.append((replacement, allocation, replacement_price))
-            if not allocation_plan:
-                skipped_no_replacement += 1
-                next_lots.append(lot)
-                continue
-
-            total_realized_loss += realized_loss
-            total_tax_benefit += tax_benefit
-            total_transaction_cost += transaction_cost
-            total_replacement_cost += replacement_cost
-            harvest_count += 1
-            sold_this_period.add(lot.ticker)
-            banned_until[lot.ticker] = day + timedelta(days=wash_sale_days)
-            period = period_rows.setdefault(
-                day,
-                {
-                    "realized_loss": 0.0,
-                    "tax_benefit": 0.0,
-                    "transaction_cost": 0.0,
-                    "replacement_cost": 0.0,
-                    "net_tax_benefit": 0.0,
-                    "harvest_count": 0.0,
-                },
-            )
-            period["realized_loss"] += realized_loss
-            period["tax_benefit"] += tax_benefit
-            period["transaction_cost"] += transaction_cost
-            period["replacement_cost"] += replacement_cost
-            period["net_tax_benefit"] += net_tax_benefit
-            period["harvest_count"] += 1.0
-
-            replacement_event_rows: List[Dict[str, object]] = []
-            for replacement, allocation, replacement_price in allocation_plan:
-                next_lots.append(
-                    SimulatedHarvestLot(
-                        ticker=replacement.ticker,
-                        sector=replacement.sector,
-                        shares=allocation / replacement_price,
-                        basis=allocation,
-                        purchase_day=day,
+                if not replacements:
+                    relaxed_unavailable = banned_tickers.union(sold_this_period, {lot.ticker})
+                    replacements = _same_sector_replacements(
+                        universe,
+                        source_candidate,
+                        relaxed_unavailable,
+                        table,
+                        day,
+                        candidate_scores,
+                        replacement_scores,
+                        replacement_count,
+                        active_tickers=pit_active_tickers,
                     )
-                )
-                replacement_event_rows.append(
+                allocation_plan: List[Tuple[Candidate, float, float]] = []
+                for replacement, allocation in _replacement_allocations(replacements, market_value):
+                    replacement_price = table.get(replacement.ticker, {}).get(day)
+                    if replacement_price and replacement_price > 0 and allocation > 0:
+                        allocation_plan.append((replacement, allocation, replacement_price))
+                if not allocation_plan:
+                    skipped_no_replacement += 1
+                    next_lots.append(lot)
+                    next_lot_tickers.add(lot.ticker)
+                    continue
+
+                total_realized_loss += realized_loss
+                total_tax_benefit += tax_benefit
+                total_transaction_cost += transaction_cost
+                total_replacement_cost += replacement_cost
+                harvest_count += 1
+                sold_this_period.add(lot.ticker)
+                banned_until[lot.ticker] = day + timedelta(days=wash_sale_days)
+                period = period_rows.setdefault(
+                    day,
                     {
-                        "ticker": replacement.ticker,
-                        "value": allocation,
-                        "price": replacement_price,
-                    }
+                        "realized_loss": 0.0,
+                        "tax_benefit": 0.0,
+                        "transaction_cost": 0.0,
+                        "replacement_cost": 0.0,
+                        "net_tax_benefit": 0.0,
+                        "harvest_count": 0.0,
+                    },
                 )
-            if len(sample_events) < sample_event_limit:
-                sample_events.append(
-                    {
-                        "date": day.isoformat(),
-                        "sold": lot.ticker,
-                        "sector": lot.sector,
-                        "basis": lot.basis,
-                        "market_value": market_value,
-                        "realized_loss": realized_loss,
-                        "unrealized_return": unrealized_return,
-                        "replacements": replacement_event_rows,
-                    }
-                )
-        lots = next_lots
+                period["realized_loss"] += realized_loss
+                period["tax_benefit"] += tax_benefit
+                period["transaction_cost"] += transaction_cost
+                period["replacement_cost"] += replacement_cost
+                period["net_tax_benefit"] += net_tax_benefit
+                period["harvest_count"] += 1.0
+
+                replacement_event_rows: List[Dict[str, object]] = []
+                for replacement, allocation, replacement_price in allocation_plan:
+                    similarity = _cached_replacement_similarity(source_candidate, replacement, replacement_scores)
+                    next_lots.append(
+                        SimulatedHarvestLot(
+                            ticker=replacement.ticker,
+                            sector=replacement.sector,
+                            industry=replacement.industry,
+                            shares=allocation / replacement_price,
+                            basis=allocation,
+                            purchase_day=day,
+                        )
+                    )
+                    next_lot_tickers.add(replacement.ticker)
+                    replacement_event_rows.append(
+                        {
+                            "ticker": replacement.ticker,
+                            "industry": replacement.industry,
+                            "value": allocation,
+                            "price": replacement_price,
+                            "beta_delta": similarity["beta_delta"],
+                            "return_correlation": similarity["correlation"],
+                            "industry_match": bool(similarity["industry_match"]),
+                        }
+                    )
+                if len(sample_events) < sample_event_limit:
+                    sample_events.append(
+                        {
+                            "date": day.isoformat(),
+                            "sold": lot.ticker,
+                            "sector": lot.sector,
+                            "industry": lot.industry,
+                            "basis": lot.basis,
+                            "market_value": market_value,
+                            "realized_loss": realized_loss,
+                            "unrealized_return": unrealized_return,
+                            "replacements": replacement_event_rows,
+                        }
+                    )
+            lots = next_lots
+
+        if day in rebalance_days:
+            lots, rebalanced = _rebalance_lots_to_targets(
+                lots,
+                selected_pairs,
+                table,
+                day,
+                banned_until,
+                pit_active_tickers,
+            )
+            if rebalanced:
+                rebalance_count += 1
+                rebalance_dates.append(day.isoformat())
 
     end_day = simulation_dates[-1]
-    years = max((end_day - start_day).days / 365.25, 1.0 / FREQUENCIES[rebalance_frequency])
+    years = max((end_day - start_day).days / 365.25, 1.0 / FREQUENCIES[tax_frequency])
     average_portfolio_value = sum(portfolio_values) / len(portfolio_values) if portfolio_values else 0.0
     ending_portfolio_value = portfolio_values[-1] if portfolio_values else 0.0
     total_net_tax_benefit = total_tax_benefit - total_transaction_cost - total_replacement_cost
@@ -1033,10 +1424,26 @@ def simulate_portfolio_harvests(
     else:
         portfolio_realized_loss_rate = 0.0
         portfolio_simulated_tax_alpha = 0.0
+    benchmark_lookup = _price_lookup_for_dates(benchmark_points, simulation_dates)
+    aligned_portfolio_values = []
+    aligned_benchmark_values = []
+    for day, portfolio_value in zip(simulation_dates, portfolio_values):
+        benchmark_value = benchmark_lookup.get(day)
+        if benchmark_value is not None and benchmark_value > 0 and portfolio_value > 0:
+            aligned_portfolio_values.append(portfolio_value)
+            aligned_benchmark_values.append(benchmark_value)
+    path_metrics = _harvest_path_metrics(
+        aligned_portfolio_values,
+        aligned_benchmark_values,
+        years,
+        tax_frequency,
+    )
 
     return {
         "status": "ok",
-        "frequency": rebalance_frequency,
+        "frequency": tax_frequency,
+        "rebalance_frequency": rebalance_frequency,
+        "harvest_frequency": tax_frequency,
         "start": start_day.isoformat(),
         "end": end_day.isoformat(),
         "years": years,
@@ -1050,7 +1457,10 @@ def simulate_portfolio_harvests(
         "total_replacement_cost": total_replacement_cost,
         "total_net_tax_benefit": total_net_tax_benefit,
         "portfolio_simulated_tax_alpha": portfolio_simulated_tax_alpha,
+        **path_metrics,
         "harvest_count": harvest_count,
+        "rebalance_count": rebalance_count,
+        "rebalance_dates": rebalance_dates,
         "skipped_no_replacement": skipped_no_replacement,
         "skipped_nonpositive_net_benefit": skipped_nonpositive_net_benefit,
         "tax_rate": tax_rate,
@@ -1059,6 +1469,7 @@ def simulate_portfolio_harvests(
         "replacement_cost_bps": replacement_cost_bps,
         "replacement_count": replacement_count,
         "wash_sale_days": wash_sale_days,
+        "point_in_time_constituents": bool(historical_holdings),
         "period_realized_losses": [
             {
                 "date": day.isoformat(),
@@ -1094,6 +1505,7 @@ def construct_portfolio(
     target_tax_alpha: float,
     rebalance_frequency: str,
     match_sectors: bool = False,
+    harvest_frequency: Optional[str] = None,
     tax_alpha_mode: str = "closest",
     min_weight: float = 0.0,
     max_weight: Optional[float] = None,
@@ -1107,9 +1519,11 @@ def construct_portfolio(
     random_seed: int = 7,
     show_progress: bool = False,
     progress_label: str = "Optimization",
+    replacement_universe: Optional[Sequence[Candidate]] = None,
 ) -> Dict[str, object]:
     if benchmark_returns is None:
         raise ValueError("benchmark_returns are required to optimize error margin")
+    tax_frequency = harvest_frequency or rebalance_frequency
     targets = sector_targets(holdings) if match_sectors else None
     initial = initial_selection(
         candidates,
@@ -1166,6 +1580,7 @@ def construct_portfolio(
                 "ticker": candidate.ticker,
                 "weight": weight,
                 "sector": candidate.sector,
+                "industry": candidate.industry,
                 "index_weight": candidate.index_weight,
                 "beta": candidate.beta,
                 "tax_alpha": candidate.tax_alpha,
@@ -1191,13 +1606,14 @@ def construct_portfolio(
             "tax_metric": tax_metric,
             "tax_assumptions": tax_assumptions or {},
             "rebalance_frequency": rebalance_frequency,
+            "harvest_frequency": tax_frequency,
             "sector_match": match_sectors,
         },
         "metrics": metrics,
         "sector_targets": sector_targets_out,
         "positions": positions,
         "replacement_candidates": replacement_candidates(
-            candidates,
+            replacement_universe or candidates,
             selected,
             error_margin,
             target_tax_alpha,

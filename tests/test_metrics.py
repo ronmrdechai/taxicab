@@ -53,6 +53,17 @@ class MetricsTests(unittest.TestCase):
             places=9,
         )
 
+    def test_daily_frequency_uses_each_price_point(self):
+        points = [
+            PricePoint(date(2020, 1, 1), 100.0),
+            PricePoint(date(2020, 1, 2), 90.0),
+            PricePoint(date(2020, 1, 3), 99.0),
+        ]
+
+        alpha = estimated_tax_loss_alpha(points, "daily")
+
+        self.assertAlmostEqual(alpha, 12.6, places=6)
+
     def test_simulated_tax_alpha_applies_tax_rate_and_resets_basis(self):
         points = [
             PricePoint(date(2020, 1, 1), 100.0),

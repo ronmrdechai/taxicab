@@ -8,3 +8,4 @@ cache/
 runs/
 portfolio.json
 orders.csv
+.DS_Store

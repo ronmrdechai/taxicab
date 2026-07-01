@@ -13,6 +13,7 @@ from taxicab.optimizer import (
     project_to_bounded_simplex,
     project_to_simplex,
     project_to_simplex_with_floor,
+    replacement_candidates,
     simulate_portfolio_harvests,
     tracking_error,
 )
@@ -90,6 +91,7 @@ class OptimizerTests(unittest.TestCase):
 
         model = prepare_tracking_model(candidates, benchmark_returns)
         assert model is not None
+        self.assertLessEqual(tracking_error(weights, model), 0.02000001)
         self.assertLess(tracking_error(weights, model), tracking_error([0.5, 0.5], model))
         self.assertGreater(weights[0], weights[1])
 
@@ -196,6 +198,225 @@ class OptimizerTests(unittest.TestCase):
             {replacement["ticker"] for replacement in event["replacements"]},
             {"AMD", "INTC"},
         )
+
+    def test_portfolio_harvest_simulation_can_harvest_daily_between_quarterly_rebalances(self):
+        dates = [
+            date(2020, 1, 1),
+            date(2020, 1, 2),
+            date(2020, 3, 31),
+            date(2020, 4, 1),
+        ]
+        benchmark_returns = returns([0.0, 0.0, 0.0, 0.0])
+        candidates = [
+            Candidate("LOSS", 0.60, "Tech", beta=1.0, tax_alpha=0.05, observations=300, returns=benchmark_returns),
+            Candidate("ALT", 0.40, "Tech", beta=1.0, tax_alpha=0.05, observations=300, returns=benchmark_returns),
+        ]
+        prices = {
+            "SPY": [PricePoint(day, 100.0) for day in dates],
+            "LOSS": [
+                PricePoint(dates[0], 100.0),
+                PricePoint(dates[1], 80.0),
+                PricePoint(dates[2], 100.0),
+                PricePoint(dates[3], 100.0),
+            ],
+            "ALT": [PricePoint(day, 100.0) for day in dates],
+        }
+
+        daily = simulate_portfolio_harvests(
+            [candidates[0]],
+            [1.0],
+            candidates,
+            prices,
+            "SPY",
+            benchmark_returns,
+            "quarterly",
+            error_margin=0.05,
+            target_tax_alpha=0.03,
+            tax_rate=0.30,
+            harvest_threshold_pct=0.05,
+            transaction_cost_bps=0.0,
+            replacement_cost_bps=0.0,
+            replacement_count=1,
+            harvest_frequency="daily",
+        )
+        quarterly = simulate_portfolio_harvests(
+            [candidates[0]],
+            [1.0],
+            candidates,
+            prices,
+            "SPY",
+            benchmark_returns,
+            "quarterly",
+            error_margin=0.05,
+            target_tax_alpha=0.03,
+            tax_rate=0.30,
+            harvest_threshold_pct=0.05,
+            transaction_cost_bps=0.0,
+            replacement_cost_bps=0.0,
+            replacement_count=1,
+            harvest_frequency="quarterly",
+        )
+
+        self.assertEqual(daily["rebalance_frequency"], "quarterly")
+        self.assertEqual(daily["harvest_frequency"], "daily")
+        self.assertEqual(daily["harvest_count"], 1)
+        self.assertEqual(daily["rebalance_count"], 1)
+        self.assertEqual(daily["sample_events"][0]["date"], "2020-01-02")
+        self.assertEqual(quarterly["harvest_count"], 0)
+
+    def test_portfolio_harvest_path_metrics_track_realized_path(self):
+        dates = [
+            date(2020, 1, 31),
+            date(2020, 2, 29),
+            date(2020, 3, 31),
+            date(2020, 4, 30),
+        ]
+        benchmark_prices = [100.0, 110.0, 99.0, 120.0]
+        benchmark_returns = {
+            dates[1]: benchmark_prices[1] / benchmark_prices[0] - 1.0,
+            dates[2]: benchmark_prices[2] / benchmark_prices[1] - 1.0,
+            dates[3]: benchmark_prices[3] / benchmark_prices[2] - 1.0,
+        }
+        candidate = Candidate(
+            "MIRROR",
+            1.0,
+            "Tech",
+            beta=1.0,
+            tax_alpha=0.0,
+            observations=300,
+            returns=benchmark_returns,
+        )
+        prices = {
+            "SPY": [PricePoint(day, price) for day, price in zip(dates, benchmark_prices)],
+            "MIRROR": [PricePoint(day, price) for day, price in zip(dates, benchmark_prices)],
+        }
+
+        simulation = simulate_portfolio_harvests(
+            [candidate],
+            [1.0],
+            [candidate],
+            prices,
+            "SPY",
+            benchmark_returns,
+            "monthly",
+            error_margin=0.05,
+            target_tax_alpha=0.03,
+            tax_rate=0.30,
+            harvest_threshold_pct=0.50,
+            transaction_cost_bps=0.0,
+            replacement_cost_bps=0.0,
+            replacement_count=1,
+        )
+
+        self.assertEqual(simulation["status"], "ok")
+        self.assertEqual(simulation["harvest_count"], 0)
+        self.assertEqual(simulation["portfolio_harvest_observations"], 3)
+        self.assertAlmostEqual(simulation["portfolio_harvest_tracking_error"], 0.0, places=12)
+        self.assertAlmostEqual(simulation["portfolio_harvest_beta"], 1.0, places=12)
+        self.assertAlmostEqual(simulation["portfolio_harvest_correlation"], 1.0, places=12)
+        self.assertAlmostEqual(simulation["portfolio_harvest_active_return"], 0.0, places=12)
+        self.assertAlmostEqual(
+            simulation["portfolio_harvest_annualized_return"],
+            simulation["benchmark_annualized_return"],
+            places=12,
+        )
+
+    def test_replacement_candidates_prefer_industry_and_return_similarity(self):
+        benchmark_returns = returns([0.01, -0.01, 0.02, -0.02, 0.015, -0.015] * 8)
+        selected = [
+            Candidate(
+                "SRC",
+                0.50,
+                "Tech",
+                beta=1.0,
+                tax_alpha=0.03,
+                returns=benchmark_returns,
+                industry="Software",
+            )
+        ]
+        universe = selected + [
+            Candidate(
+                "SAME",
+                0.20,
+                "Tech",
+                beta=1.02,
+                tax_alpha=0.03,
+                returns={day: value * 1.02 for day, value in benchmark_returns.items()},
+                industry="Software",
+            ),
+            Candidate(
+                "DIFF",
+                0.30,
+                "Tech",
+                beta=1.0,
+                tax_alpha=0.03,
+                returns={day: value * -1.0 for day, value in benchmark_returns.items()},
+                industry="Hardware",
+            ),
+        ]
+
+        replacements = replacement_candidates(
+            universe,
+            selected,
+            error_margin=0.05,
+            target_tax_alpha=0.03,
+            benchmark_returns=benchmark_returns,
+        )
+
+        self.assertEqual(replacements["SRC"][0]["ticker"], "SAME")
+        self.assertTrue(replacements["SRC"][0]["industry_match"])
+        self.assertGreater(replacements["SRC"][0]["return_correlation"], 0.9)
+
+    def test_portfolio_harvest_simulation_uses_point_in_time_active_replacements(self):
+        dates = [date(2020, 1, 31), date(2020, 2, 29), date(2020, 3, 31)]
+        benchmark_returns = returns([0.0, 0.0, 0.0])
+        candidates = [
+            Candidate("NVDA", 0.40, "Tech", beta=1.0, tax_alpha=0.05, observations=300, returns=benchmark_returns, industry="Semiconductors"),
+            Candidate("AMD", 0.35, "Tech", beta=1.0, tax_alpha=0.05, observations=300, returns=benchmark_returns, industry="Semiconductors"),
+            Candidate("INTC", 0.25, "Tech", beta=1.0, tax_alpha=0.05, observations=300, returns=benchmark_returns, industry="Semiconductors"),
+        ]
+        prices = {
+            "SPY": [PricePoint(day, 100.0) for day in dates],
+            "NVDA": [
+                PricePoint(dates[0], 100.0),
+                PricePoint(dates[1], 80.0),
+                PricePoint(dates[2], 90.0),
+            ],
+            "AMD": [PricePoint(day, 50.0) for day in dates],
+            "INTC": [PricePoint(day, 25.0) for day in dates],
+        }
+        historical_holdings = {
+            dates[0]: [
+                Holding("NVDA", 0.5, "Tech", "Semiconductors"),
+                Holding("AMD", 0.5, "Tech", "Semiconductors"),
+            ],
+            dates[1]: [
+                Holding("NVDA", 0.5, "Tech", "Semiconductors"),
+                Holding("AMD", 0.5, "Tech", "Semiconductors"),
+            ],
+        }
+
+        simulation = simulate_portfolio_harvests(
+            [candidates[0]],
+            [1.0],
+            candidates,
+            prices,
+            "SPY",
+            benchmark_returns,
+            "monthly",
+            error_margin=0.05,
+            target_tax_alpha=0.03,
+            tax_rate=0.30,
+            harvest_threshold_pct=0.05,
+            transaction_cost_bps=0.0,
+            replacement_cost_bps=0.0,
+            replacement_count=2,
+            historical_holdings=historical_holdings,
+        )
+
+        replacements = simulation["sample_events"][0]["replacements"]
+        self.assertEqual([replacement["ticker"] for replacement in replacements], ["AMD"])
+        self.assertTrue(simulation["point_in_time_constituents"])
 
 
 if __name__ == "__main__":

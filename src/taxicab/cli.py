@@ -4,13 +4,9 @@ import argparse
 from datetime import datetime, timezone
 from pathlib import Path
 import sys
-import time
 from typing import Dict, Optional, Sequence
 
-try:
-    from tqdm.auto import tqdm
-except ImportError:  # pragma: no cover - exercised only before dependencies are installed
-    tqdm = None
+from tqdm.auto import tqdm
 
 from .comparison import compare_portfolios, parse_labeled_path
 from .data import (
@@ -18,11 +14,16 @@ from .data import (
     date_range_for_years,
     download_yahoo_prices,
     enrich_sectors,
+    holdings_universe,
+    latest_historical_holdings,
     load_holdings_source,
     parse_date,
+    read_historical_holdings_cache,
+    read_historical_holdings_csv,
     read_cache,
     read_json,
     read_price_series_csv,
+    read_prices_csv,
     write_cache,
     write_json,
 )
@@ -31,61 +32,29 @@ from .optimizer import build_candidates, construct_portfolio, simulate_portfolio
 from .rebalance import plan_rebalance, read_current_positions, write_operations_csv
 
 
+REBALANCE_FREQUENCIES = {name for name in FREQUENCIES if name != "daily"}
+
+
 class Progress:
     def __init__(self, label: str, total: int, every: int = 25) -> None:
-        self.label = label
         self.total = max(total, 1)
-        self.every = max(every, 1)
-        self.started_at = time.monotonic()
         self.last_count = 0
-        self.bar = tqdm(total=self.total, desc=label, unit="item") if tqdm else None
-        self.is_tty = sys.stderr.isatty()
+        self.bar = tqdm(total=self.total, desc=label, unit="item")
 
     def update(self, count: int, suffix: str = "") -> None:
-        if self.bar:
-            delta = max(count - self.last_count, 0)
-            if suffix:
-                self.bar.set_postfix_str(suffix)
-            if delta:
-                self.bar.update(delta)
-            self.last_count = count
-            return
+        delta = max(count - self.last_count, 0)
+        if suffix:
+            self.bar.set_postfix_str(suffix)
+        if delta:
+            self.bar.update(delta)
         self.last_count = count
-        if self.is_tty:
-            self._render(count, suffix, final=False)
-            return
-        if count == 1 or count % self.every == 0 or count >= self.total:
-            message = self._message(count, suffix)
-            print(message, file=sys.stderr, flush=True)
 
     def done(self, suffix: str = "") -> None:
-        if self.bar:
-            if suffix:
-                self.bar.set_postfix_str(suffix)
-            if self.last_count < self.total:
-                self.bar.update(self.total - self.last_count)
-            self.bar.close()
-            return
-        if self.is_tty:
-            self._render(self.last_count or self.total, suffix, final=True)
-        elif self.last_count < self.total:
-            print(self._message(self.total, suffix), file=sys.stderr, flush=True)
-
-    def _message(self, count: int, suffix: str) -> str:
-        elapsed = max(time.monotonic() - self.started_at, 0.001)
-        rate = count / elapsed
-        base = f"{self.label}: {count}/{self.total} ({rate:.1f}/s)"
-        return f"{base}; {suffix}" if suffix else base
-
-    def _render(self, count: int, suffix: str, final: bool) -> None:
-        width = 28
-        ratio = min(max(count / self.total, 0.0), 1.0)
-        filled = int(width * ratio)
-        bar = "#" * filled + "-" * (width - filled)
-        message = f"\r{self.label}: [{bar}] {count}/{self.total}"
         if suffix:
-            message += f" | {suffix}"
-        print(message, end="\n" if final else "", file=sys.stderr, flush=True)
+            self.bar.set_postfix_str(suffix)
+        if self.last_count < self.total:
+            self.bar.update(self.total - self.last_count)
+        self.bar.close()
 
 
 def add_construct_arguments(
@@ -158,9 +127,15 @@ def add_construct_arguments(
     )
     parser.add_argument(
         "--rebalance-frequency",
-        choices=sorted(FREQUENCIES),
+        choices=sorted(REBALANCE_FREQUENCIES),
         default="quarterly",
-        help="Historical rebalance window used for the tax-loss estimate.",
+        help="Target-weight rebalance cadence. Default: quarterly.",
+    )
+    parser.add_argument(
+        "--harvest-frequency",
+        choices=sorted(FREQUENCIES),
+        default="daily",
+        help="Tax-loss harvesting check cadence used for tax-alpha estimates and simulations. Default: daily.",
     )
     if include_sector_match:
         parser.add_argument("--sector-match", action="store_true", help="Match sector weights to the index.")
@@ -223,7 +198,15 @@ def build_parser() -> argparse.ArgumentParser:
     holdings.add_argument("--holdings-url", help="Remote holdings CSV URL for the ETF or abstract index.")
     holdings.add_argument("--holdings-xlsx", help="Local holdings XLSX for the ETF or abstract index.")
     holdings.add_argument("--holdings-xlsx-url", help="Remote holdings XLSX URL for the ETF or abstract index.")
+    holdings.add_argument(
+        "--historical-holdings-csv",
+        help="Point-in-time holdings snapshots CSV. Uses the latest snapshot as current holdings.",
+    )
     download.add_argument("--index-prices-csv", help="Optional local benchmark price CSV for abstract indexes.")
+    download.add_argument(
+        "--prices-csv",
+        help="Optional local ticker/date/price CSV for constituents, including delisted names.",
+    )
     download.add_argument("--data-dir", required=True, help="Cache directory to create or overwrite.")
     download.add_argument("--years", type=int, default=30, help="Historical years to download. Default: 30.")
     download.add_argument("--start", help="Start date YYYY-MM-DD. Overrides --years when supplied.")
@@ -303,12 +286,24 @@ def command_download(args: argparse.Namespace) -> int:
         end_day = requested_end or date_range_for_years(args.years)[1]
     else:
         start, end_day = date_range_for_years(args.years, requested_end)
-    holdings = load_holdings_source(
-        args.holdings_csv,
-        args.holdings_url,
-        args.holdings_xlsx,
-        args.holdings_xlsx_url,
-    )
+    historical_holdings = {}
+    if args.historical_holdings_csv:
+        historical_holdings = read_historical_holdings_csv(args.historical_holdings_csv)
+        holdings = latest_historical_holdings(historical_holdings)
+        print(
+            "Loaded {} point-in-time snapshots; latest has {} holdings".format(
+                len(historical_holdings),
+                len(holdings),
+            ),
+            flush=True,
+        )
+    else:
+        holdings = load_holdings_source(
+            args.holdings_csv,
+            args.holdings_url,
+            args.holdings_xlsx,
+            args.holdings_xlsx_url,
+        )
     print(f"Loaded {len(holdings)} holdings", flush=True)
     sector_progress = Progress("Sectors", len(holdings))
     holdings, sector_failures = enrich_sectors(
@@ -320,20 +315,24 @@ def command_download(args: argparse.Namespace) -> int:
     if args.sector_source != "none":
         print(f"Sector enrichment complete; failures: {len(sector_failures)}", flush=True)
 
-    prices: Dict[str, object] = {}
+    prices: Dict[str, object] = read_prices_csv(args.prices_csv) if args.prices_csv else {}
     failures: Dict[str, str] = {}
     benchmark = args.index.upper()
     print(f"Downloading benchmark prices for {benchmark}", flush=True)
     if args.index_prices_csv:
         prices[benchmark] = read_price_series_csv(args.index_prices_csv)
-    else:
+    elif benchmark not in prices:
         try:
             prices[benchmark] = download_yahoo_prices(benchmark, start, end_day, price_field=args.price_field)
         except Exception as exc:
             raise RuntimeError(f"failed to download benchmark prices for {benchmark}: {exc}") from exc
 
-    price_progress = Progress("Prices", len(holdings))
-    for idx, holding in enumerate(holdings, start=1):
+    price_holdings = holdings_universe(holdings, historical_holdings)
+    price_progress = Progress("Prices", len(price_holdings))
+    for idx, holding in enumerate(price_holdings, start=1):
+        if holding.ticker in prices:
+            price_progress.update(idx, suffix=f"failures: {len(failures)}")
+            continue
         try:
             points = download_yahoo_prices(holding.ticker, start, end_day, price_field=args.price_field)
             if points:
@@ -357,8 +356,12 @@ def command_download(args: argparse.Namespace) -> int:
         "sector_source": args.sector_source,
         "sector_failures": sector_failures,
         "price_failures": failures,
+        "historical_holdings": bool(historical_holdings),
+        "historical_holdings_snapshots": len(historical_holdings),
+        "historical_holdings_start": min(historical_holdings).isoformat() if historical_holdings else None,
+        "historical_holdings_end": max(historical_holdings).isoformat() if historical_holdings else None,
     }
-    write_cache(args.data_dir, holdings, prices, metadata)
+    write_cache(args.data_dir, holdings, prices, metadata, historical_holdings=historical_holdings)
     paths = cache_paths(args.data_dir)
     print(f"Wrote cache to {paths['root']}")
     print(f"Holdings: {len(holdings)}; price series: {len(prices)}; missing prices: {len(failures)}")
@@ -367,11 +370,13 @@ def command_download(args: argparse.Namespace) -> int:
 
 def construct_context(args: argparse.Namespace):
     holdings, prices, metadata = read_cache(args.data_dir)
+    historical_holdings = read_historical_holdings_cache(args.data_dir)
     benchmark = str(metadata.get("index", "")).upper()
     if not benchmark:
         raise ValueError("metadata.json is missing index")
-    candidates = build_candidates(
-        holdings,
+    universe_holdings = holdings_universe(holdings, historical_holdings)
+    all_candidates = build_candidates(
+        universe_holdings,
         prices,
         benchmark,
         args.rebalance_frequency,
@@ -381,13 +386,16 @@ def construct_context(args: argparse.Namespace):
         harvest_threshold_pct=args.harvest_threshold_pct,
         transaction_cost_bps=args.transaction_cost_bps,
         replacement_cost_bps=args.replacement_cost_bps,
+        harvest_frequency=args.harvest_frequency,
     )
+    current_tickers = {holding.ticker for holding in holdings}
+    candidates = [candidate for candidate in all_candidates if candidate.ticker in current_tickers]
     if len(candidates) < args.sample_size:
         raise ValueError(
             f"Only {len(candidates)} candidates have enough price history; "
             f"sample size is {args.sample_size}."
         )
-    return holdings, prices, metadata, benchmark, candidates
+    return holdings, prices, metadata, benchmark, candidates, all_candidates, historical_holdings
 
 
 def construct_from_args(
@@ -397,6 +405,8 @@ def construct_from_args(
     metadata,
     benchmark: str,
     candidates,
+    replacement_universe,
+    historical_holdings,
     *,
     match_sectors: bool,
     progress_label: str = "Optimization",
@@ -410,6 +420,7 @@ def construct_from_args(
         args.target_tax_alpha,
         args.rebalance_frequency,
         match_sectors=match_sectors,
+        harvest_frequency=args.harvest_frequency,
         tax_alpha_mode=args.tax_alpha_mode,
         min_weight=args.min_weight,
         max_weight=args.max_weight,
@@ -430,12 +441,13 @@ def construct_from_args(
         random_seed=args.seed,
         show_progress=show_progress,
         progress_label=progress_label,
+        replacement_universe=replacement_universe,
     )
-    attach_portfolio_context(portfolio, args.data_dir, prices, metadata, candidates)
+    attach_portfolio_context(portfolio, args.data_dir, prices, metadata, replacement_universe, historical_holdings)
     return portfolio
 
 
-def attach_portfolio_context(portfolio, data_dir: str, prices, metadata, candidates) -> None:
+def attach_portfolio_context(portfolio, data_dir: str, prices, metadata, candidates, historical_holdings=None) -> None:
     for position in portfolio["positions"]:
         ticker = str(position.get("ticker", "")).upper()
         points = prices.get(ticker, [])
@@ -472,6 +484,8 @@ def attach_portfolio_context(portfolio, data_dir: str, prices, metadata, candida
             replacement_cost_bps=float(tax_assumptions.get("replacement_cost_bps", 10.0)),
             replacement_count=int(tax_assumptions.get("replacement_count", 2)),
             wash_sale_days=int(tax_assumptions.get("wash_sale_days", 31)),
+            historical_holdings=historical_holdings or None,
+            harvest_frequency=str(targets.get("harvest_frequency", targets.get("rebalance_frequency", "quarterly"))),
         )
         portfolio["portfolio_harvest_simulation"] = simulation
         metrics = portfolio.setdefault("metrics", {})
@@ -480,10 +494,19 @@ def attach_portfolio_context(portfolio, data_dir: str, prices, metadata, candida
         metrics["portfolio_annual_realized_loss"] = simulation["annual_realized_loss"]
         metrics["portfolio_total_realized_loss"] = simulation["total_realized_loss"]
         metrics["portfolio_harvest_count"] = simulation["harvest_count"]
+        metrics["portfolio_rebalance_count"] = simulation["rebalance_count"]
+        metrics["portfolio_harvest_annualized_return"] = simulation["portfolio_harvest_annualized_return"]
+        metrics["benchmark_annualized_return"] = simulation["benchmark_annualized_return"]
+        metrics["portfolio_harvest_active_return"] = simulation["portfolio_harvest_active_return"]
+        metrics["portfolio_harvest_tracking_error"] = simulation["portfolio_harvest_tracking_error"]
+        metrics["portfolio_harvest_beta"] = simulation["portfolio_harvest_beta"]
+        metrics["portfolio_harvest_correlation"] = simulation["portfolio_harvest_correlation"]
+        metrics["portfolio_harvest_observations"] = simulation["portfolio_harvest_observations"]
     portfolio["source_cache"] = {
         "data_dir": str(Path(data_dir).resolve()),
         "metadata": metadata,
         "candidate_count": len(candidates),
+        "point_in_time_constituents": bool(historical_holdings),
     }
 
 
@@ -516,10 +539,20 @@ def print_construct_summary(portfolio, *, sector_match: bool) -> None:
         )
     if "portfolio_simulated_tax_alpha" in metrics:
         print(
-            "Portfolio harvest alpha={:.4f}, realized loss rate={:.4f}, harvests={}".format(
+            "Portfolio harvest alpha={:.4f}, realized loss rate={:.4f}, harvests={}, rebalances={}".format(
                 float(metrics["portfolio_simulated_tax_alpha"]),
                 float(metrics["portfolio_realized_loss_rate"]),
                 int(metrics["portfolio_harvest_count"]),
+                int(metrics.get("portfolio_rebalance_count", 0)),
+            )
+        )
+    if "portfolio_harvest_tracking_error" in metrics:
+        print(
+            "Harvest path tracking error={:.4f}, active return={:.4f}, beta={:.4f}, correlation={:.4f}".format(
+                float(metrics["portfolio_harvest_tracking_error"]),
+                float(metrics["portfolio_harvest_active_return"]),
+                float(metrics["portfolio_harvest_beta"]),
+                float(metrics["portfolio_harvest_correlation"]),
             )
         )
     if sector_match:
@@ -527,7 +560,7 @@ def print_construct_summary(portfolio, *, sector_match: bool) -> None:
 
 
 def command_construct(args: argparse.Namespace) -> int:
-    holdings, prices, metadata, benchmark, candidates = construct_context(args)
+    holdings, prices, metadata, benchmark, candidates, replacement_universe, historical_holdings = construct_context(args)
     portfolio = construct_from_args(
         args,
         holdings,
@@ -535,6 +568,8 @@ def command_construct(args: argparse.Namespace) -> int:
         metadata,
         benchmark,
         candidates,
+        replacement_universe,
+        historical_holdings,
         match_sectors=args.sector_match,
         progress_label="Construct",
     )
@@ -545,7 +580,7 @@ def command_construct(args: argparse.Namespace) -> int:
 
 
 def command_sector_study(args: argparse.Namespace) -> int:
-    holdings, prices, metadata, benchmark, candidates = construct_context(args)
+    holdings, prices, metadata, benchmark, candidates, replacement_universe, historical_holdings = construct_context(args)
     prefix = Path(args.output_prefix)
     no_sector_path = Path(f"{prefix}_no_sector.json")
     sector_path = Path(f"{prefix}_sector.json")
@@ -558,6 +593,8 @@ def command_sector_study(args: argparse.Namespace) -> int:
         metadata,
         benchmark,
         candidates,
+        replacement_universe,
+        historical_holdings,
         match_sectors=False,
         progress_label="No-sector",
     )
@@ -568,6 +605,8 @@ def command_sector_study(args: argparse.Namespace) -> int:
         metadata,
         benchmark,
         candidates,
+        replacement_universe,
+        historical_holdings,
         match_sectors=True,
         progress_label="Sector-matched",
     )

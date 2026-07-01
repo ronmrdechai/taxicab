@@ -16,29 +16,32 @@ python3 -m pip install -e .
 You can also run it through `uv` without installing:
 
 ```bash
-UV_CACHE_DIR=.uv-cache PYTHONPATH=src uv run --no-project python -m taxicab.cli --help
+UV_CACHE_DIR=.uv-cache PYTHONPATH=src uv run --with numpy --with scipy --with tqdm --no-project python -m taxicab.cli --help
 ```
 
-NumPy is a required dependency and is used for the optimizer's tracking-error covariance and projected-gradient math.
+NumPy and SciPy are required dependencies. NumPy is used for tracking-error covariance math, and SciPy is used for constrained continuous weight optimization.
 
 ## Data Model
 
 The cache is built from:
 
 - a benchmark index symbol, such as `SPY`, `IVV`, `VOO`, or an abstract symbol you use internally
-- a holdings CSV/XLSX file or URL
-- historical close prices downloaded during the explicit `download` command
-- sector tags from the holdings CSV and, when missing, Yahoo Finance sector metadata
+- a current holdings CSV/XLSX file or URL, or a point-in-time historical holdings CSV
+- historical close prices downloaded during the explicit `download` command, plus optional local constituent prices
+- sector and industry tags from the holdings CSV and, when missing, Yahoo Finance sector metadata for current holdings
 
 Holdings CSV columns are intentionally flexible. The loader recognizes common names:
 
 - ticker: `ticker`, `symbol`, `holding_ticker`
 - weight: `weight`, `weight_pct`, `% weight`, `portfolio_weight`
 - sector: `sector`, `gics_sector`, `morningstar_sector`
+- industry: `industry`, `gics_industry`, `gics_sub_industry`
 
 Weights can be percentages (`6.2`) or decimals (`0.062`).
 
 For ETFs, use the issuer's holdings export as `--holdings-csv`, `--holdings-url`, `--holdings-xlsx`, or `--holdings-xlsx-url`. For abstract indexes, provide your own holdings file. This keeps the optimizer deterministic and avoids relying on one brittle ETF holdings endpoint.
+
+For survivorship-bias-aware backtests, provide point-in-time snapshots with `--historical-holdings-csv`. The CSV needs a snapshot date column (`date`, `as_of`, or `snapshot_date`) plus ticker/weight/sector/industry columns. Taxicab uses the latest snapshot as the current construction universe, uses all historical snapshot tickers as the replacement universe, and restricts harvest replacements to names active in the latest snapshot on or before each simulated date. To include delisted names, also provide their historical prices in a local `--prices-csv` with `date`, `ticker`, and `adj_close`/`close` columns; public quote APIs often cannot recover delisted histories reliably.
 
 ## Example
 
@@ -51,6 +54,19 @@ taxicab download \
   --data-dir ./cache/spy \
   --years 30 \
   --price-field close
+```
+
+Download from point-in-time historical constituents and local constituent prices:
+
+```bash
+taxicab download \
+  --index SPY \
+  --historical-holdings-csv ./sp500_constituents_pit.csv \
+  --prices-csv ./sp500_constituent_prices.csv \
+  --data-dir ./cache/sp500_pit \
+  --years 30 \
+  --price-field close \
+  --sector-source none
 ```
 
 Construct a 75-stock sample targeting a 5% annualized error margin and 3% estimated tax-loss alpha:
@@ -70,6 +86,7 @@ taxicab construct \
   --replacement-count 2 \
   --wash-sale-days 31 \
   --rebalance-frequency quarterly \
+  --harvest-frequency daily \
   --min-weight 0.0001 \
   --max-weight 0.08 \
   --progress \
@@ -88,6 +105,7 @@ taxicab sector-study \
   --tax-metric simulated \
   --tax-alpha-mode at-least \
   --rebalance-frequency quarterly \
+  --harvest-frequency daily \
   --max-weight 0.08 \
   --progress \
   --output-prefix ./runs/spy_sector_study
@@ -125,16 +143,16 @@ For each candidate stock, the optimizer estimates:
 - **price beta:** covariance of stock returns to benchmark returns divided by benchmark variance, emitted as a diagnostic
 - **tracking error:** annualized standard deviation of portfolio active returns versus the benchmark
 - **simulated tax alpha:** annualized after-cost tax benefit from a simple one-stock loss-harvesting lot simulation
-- **gross harvestable loss rate:** annualized pre-tax loss opportunity across historical rebalance windows
+- **gross harvestable loss rate:** annualized pre-tax loss opportunity across historical harvest windows
 - **sector:** issuer/online sector tag, used to match the index sector mix when requested
 
-The selected portfolio minimizes tracking error against the requested error margin and tax-loss alpha, optionally matching sector weights at the same aggregate level as the index. It then solves long-only weights on the selected names.
+The selected portfolio minimizes tracking error against the requested error margin and tax-loss alpha, optionally matching sector weights at the same aggregate level as the index. It then solves long-only weights on the selected names with a constrained SciPy optimizer.
 
-The default optimizer tax-alpha model buys one lot for each candidate stock, checks it at each rebalance date, harvests only when the unrealized loss is beyond `--harvest-threshold-pct`, applies `--tax-rate` to the realized loss, subtracts round-trip transaction cost and replacement/tracking cost, then resets basis. The older gross metric is still emitted for diagnostics because it explains volatility-driven harvest opportunity, but it is not an after-tax return estimate.
+The default optimizer tax-alpha model buys one lot for each candidate stock, checks it at each `--harvest-frequency` date, harvests only when the unrealized loss is beyond `--harvest-threshold-pct`, applies `--tax-rate` to the realized loss, subtracts round-trip transaction cost and replacement/tracking cost, then resets basis. The older gross metric is still emitted for diagnostics because it explains volatility-driven harvest opportunity, but it is not an after-tax return estimate.
 
-After construction, Taxicab also runs a portfolio-level historical harvest simulation. It starts with the selected portfolio, checks positions on the requested `--rebalance-frequency` (`monthly`, `quarterly`, `half-yearly`/`halfly`, or `yearly`/`annually`), realizes loss lots whose after-tax benefit is positive after costs, and replaces each harvested stock with up to `--replacement-count` same-sector alternatives while avoiding recently harvested tickers for `--wash-sale-days`. The output JSON includes `portfolio_harvest_simulation` plus summary metrics such as `portfolio_realized_loss_rate`, `portfolio_annual_realized_loss`, and `portfolio_simulated_tax_alpha`.
+After construction, Taxicab also runs a portfolio-level historical harvest simulation. It starts with the selected portfolio, checks positions on the requested `--harvest-frequency` (`daily`, `monthly`, `quarterly`, `half-yearly`/`halfly`, or `yearly`/`annually`), realizes loss lots whose after-tax benefit is positive after costs, and replaces each harvested stock with up to `--replacement-count` alternatives while avoiding recently harvested tickers for `--wash-sale-days`. Separately, it rebalances target weights on `--rebalance-frequency`, which defaults to quarterly. Replacements are filtered to the same sector, prefer the same industry, and are ranked by beta distance and return correlation to the harvested stock. When point-in-time historical constituents are cached, replacements are also restricted to names active in the index at that simulated date. The output JSON includes `portfolio_harvest_simulation` plus summary metrics such as `portfolio_realized_loss_rate`, `portfolio_annual_realized_loss`, `portfolio_simulated_tax_alpha`, `portfolio_harvest_tracking_error`, `portfolio_harvest_beta`, `portfolio_harvest_correlation`, and `portfolio_harvest_active_return`.
 
-Tracking-aware construction can also use `--max-weight`. When weight moves breach `--error-margin`, construction repairs tax-seeking moves back toward the selected index weights. This deliberately gives up tax opportunity when the tax objective conflicts with index-like behavior.
+Tracking-aware construction can also use `--max-weight`. The constrained weight solver enforces `--error-margin` when the selected names can feasibly meet it, which can give up tax opportunity when the tax objective conflicts with index-like behavior.
 
 Construction uses `tqdm` progress bars for the selection and weight optimization passes in interactive terminals. Use `--progress` to force them in redirected/non-interactive runs, or `--no-progress` to silence them.
 
@@ -143,5 +161,5 @@ Important caveat: simulated tax alpha is still a model, not a tax opinion or a g
 ## Tests
 
 ```bash
-UV_CACHE_DIR=.uv-cache PYTHONPATH=src uv run --no-project python -m unittest discover -s tests
+UV_CACHE_DIR=.uv-cache PYTHONPATH=src uv run --with numpy --with scipy --with tqdm --no-project python -m unittest discover -s tests
 ```

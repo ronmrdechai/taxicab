@@ -12,7 +12,7 @@ import zipfile
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import xml.etree.ElementTree as ET
 
 
@@ -25,6 +25,7 @@ class Holding:
     ticker: str
     weight: float
     sector: str = "Unknown"
+    industry: str = "Unknown"
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,10 @@ def normalize_sector(value: str) -> str:
     if not sector or sector.upper() in {"-", "N/A", "NA", "NONE"}:
         return "Unknown"
     return sector
+
+
+def normalize_industry(value: str) -> str:
+    return normalize_sector(value)
 
 
 def yahoo_symbol(ticker: str) -> str:
@@ -128,6 +133,18 @@ def parse_holdings_csv(text: str) -> List[Holding]:
             "morningstar sector",
         ],
     )
+    industry_col = _first_column(
+        columns,
+        [
+            "industry",
+            "gics_industry",
+            "gics industry",
+            "sub_industry",
+            "sub-industry",
+            "gics_sub_industry",
+            "gics sub-industry",
+        ],
+    )
 
     holdings: List[Holding] = []
     for row in reader:
@@ -137,19 +154,88 @@ def parse_holdings_csv(text: str) -> List[Holding]:
         raw_weight = row.get(weight_col, "") if weight_col else ""
         weight = normalize_weight(raw_weight) if weight_col else 0.0
         sector = normalize_sector(row.get(sector_col, "") if sector_col else "")
-        holdings.append(Holding(ticker=ticker, weight=weight, sector=sector))
+        industry = normalize_industry(row.get(industry_col, "") if industry_col else "")
+        holdings.append(Holding(ticker=ticker, weight=weight, sector=sector, industry=industry))
 
     if not holdings:
         raise ValueError("holdings CSV did not contain any usable tickers")
 
+    return normalize_holdings(holdings)
+
+
+def normalize_holdings(holdings: Sequence[Holding]) -> List[Holding]:
+    if not holdings:
+        return []
     if all(h.weight <= 0 for h in holdings):
         equal_weight = 1.0 / len(holdings)
-        return [Holding(h.ticker, equal_weight, h.sector) for h in holdings]
+        return [Holding(h.ticker, equal_weight, h.sector, h.industry) for h in holdings]
 
     total = sum(max(0.0, h.weight) for h in holdings)
     if total <= 0:
         raise ValueError("holdings CSV weights sum to zero")
-    return [Holding(h.ticker, max(0.0, h.weight) / total, h.sector) for h in holdings]
+    return [Holding(h.ticker, max(0.0, h.weight) / total, h.sector, h.industry) for h in holdings]
+
+
+def read_historical_holdings_csv(path: os.PathLike[str] | str) -> Dict[date, List[Holding]]:
+    with open(path, newline="", encoding="utf-8-sig") as handle:
+        return parse_historical_holdings_csv(handle.read())
+
+
+def parse_historical_holdings_csv(text: str) -> Dict[date, List[Holding]]:
+    sample = _holdings_csv_body(text)
+    if not sample:
+        raise ValueError("historical holdings CSV is empty")
+
+    reader = csv.DictReader(sample.splitlines())
+    if not reader.fieldnames:
+        raise ValueError("historical holdings CSV has no header row")
+
+    columns = _column_lookup(reader.fieldnames)
+    date_col = _first_column(columns, ["date", "day", "as_of", "as of", "as_of_date", "snapshot_date"])
+    ticker_col = _first_column(columns, ["ticker", "symbol", "holding_ticker", "holding ticker", "ticker symbol"])
+    weight_col = _first_column(columns, ["weight", "weight_pct", "weight (%)", "% weight", "portfolio_weight", "portfolio weight", "index weight"])
+    sector_col = _first_column(columns, ["sector", "gics_sector", "gics sector", "morningstar_sector", "morningstar sector"])
+    industry_col = _first_column(
+        columns,
+        ["industry", "gics_industry", "gics industry", "sub_industry", "sub-industry", "gics_sub_industry", "gics sub-industry"],
+    )
+    if not date_col or not ticker_col:
+        raise ValueError("historical holdings CSV needs date and ticker columns")
+
+    snapshots: Dict[date, List[Holding]] = {}
+    for row in reader:
+        ticker = normalize_ticker(row.get(ticker_col, ""))
+        if not ticker or ticker in {"-", "N/A", "CASH", "USD"}:
+            continue
+        day = parse_date(row[date_col])
+        raw_weight = row.get(weight_col, "") if weight_col else ""
+        weight = normalize_weight(raw_weight) if weight_col else 0.0
+        sector = normalize_sector(row.get(sector_col, "") if sector_col else "")
+        industry = normalize_industry(row.get(industry_col, "") if industry_col else "")
+        snapshots.setdefault(day, []).append(Holding(ticker, weight, sector, industry))
+
+    if not snapshots:
+        raise ValueError("historical holdings CSV did not contain any usable rows")
+    return {day: normalize_holdings(holdings) for day, holdings in sorted(snapshots.items())}
+
+
+def latest_historical_holdings(snapshots: Mapping[date, Sequence[Holding]]) -> List[Holding]:
+    if not snapshots:
+        raise ValueError("historical holdings snapshots are empty")
+    return list(snapshots[max(snapshots)])
+
+
+def holdings_universe(
+    current_holdings: Sequence[Holding],
+    historical_holdings: Mapping[date, Sequence[Holding]],
+) -> List[Holding]:
+    by_ticker: Dict[str, Holding] = {holding.ticker: holding for holding in current_holdings}
+    for day in sorted(historical_holdings):
+        for holding in historical_holdings[day]:
+            by_ticker[holding.ticker] = holding
+    for holding in current_holdings:
+        by_ticker[holding.ticker] = holding
+    return list(by_ticker.values())
 
 
 def _holdings_csv_body(text: str) -> str:
@@ -168,7 +254,7 @@ def _holdings_csv_body(text: str) -> str:
 
 def write_holdings_csv(holdings: Sequence[Holding], path: os.PathLike[str] | str) -> None:
     with open(path, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["ticker", "weight", "sector"])
+        writer = csv.DictWriter(handle, fieldnames=["ticker", "weight", "sector", "industry"])
         writer.writeheader()
         for holding in holdings:
             writer.writerow(
@@ -176,8 +262,29 @@ def write_holdings_csv(holdings: Sequence[Holding], path: os.PathLike[str] | str
                     "ticker": holding.ticker,
                     "weight": f"{holding.weight:.12f}",
                     "sector": holding.sector,
+                    "industry": holding.industry,
                 }
             )
+
+
+def write_historical_holdings_csv(
+    snapshots: Mapping[date, Sequence[Holding]],
+    path: os.PathLike[str] | str,
+) -> None:
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["date", "ticker", "weight", "sector", "industry"])
+        writer.writeheader()
+        for day in sorted(snapshots):
+            for holding in snapshots[day]:
+                writer.writerow(
+                    {
+                        "date": day.isoformat(),
+                        "ticker": holding.ticker,
+                        "weight": f"{holding.weight:.12f}",
+                        "sector": holding.sector,
+                        "industry": holding.industry,
+                    }
+                )
 
 
 def read_holdings_xlsx(path: os.PathLike[str] | str) -> List[Holding]:
@@ -406,6 +513,7 @@ def enrich_sectors(
                 ticker=holding.ticker,
                 weight=holding.weight,
                 sector=sector or holding.sector or "Unknown",
+                industry=holding.industry,
             )
         )
         if pause_seconds > 0:
@@ -479,6 +587,7 @@ def cache_paths(data_dir: os.PathLike[str] | str) -> Dict[str, Path]:
     return {
         "root": root,
         "holdings": root / "holdings.csv",
+        "historical_holdings": root / "historical_holdings.csv",
         "prices": root / "prices.csv",
         "metadata": root / "metadata.json",
     }
@@ -489,10 +598,13 @@ def write_cache(
     holdings: Sequence[Holding],
     prices_by_ticker: Dict[str, Sequence[PricePoint]],
     metadata: Dict[str, object],
+    historical_holdings: Optional[Mapping[date, Sequence[Holding]]] = None,
 ) -> None:
     paths = cache_paths(data_dir)
     paths["root"].mkdir(parents=True, exist_ok=True)
     write_holdings_csv(holdings, paths["holdings"])
+    if historical_holdings:
+        write_historical_holdings_csv(historical_holdings, paths["historical_holdings"])
     write_prices_csv(prices_by_ticker, paths["prices"])
     write_json(metadata, paths["metadata"])
 
@@ -507,6 +619,13 @@ def read_cache(
     if not isinstance(metadata, dict):
         raise ValueError("metadata.json must contain an object")
     return holdings, prices, metadata
+
+
+def read_historical_holdings_cache(data_dir: os.PathLike[str] | str) -> Dict[date, List[Holding]]:
+    path = cache_paths(data_dir)["historical_holdings"]
+    if not path.exists():
+        return {}
+    return read_historical_holdings_csv(path)
 
 
 def date_range_for_years(years: int, end: Optional[date] = None) -> Tuple[date, date]:
