@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import date
-from statistics import mean
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 from .data import PricePoint
@@ -42,24 +41,39 @@ def covariance(xs: Sequence[float], ys: Sequence[float]) -> float:
         raise ValueError("series lengths must match")
     if len(xs) < 2:
         return 0.0
-    x_bar = mean(xs)
-    y_bar = mean(ys)
+    x_bar = sum(xs) / len(xs)
+    y_bar = sum(ys) / len(ys)
     return sum((x - x_bar) * (y - y_bar) for x, y in zip(xs, ys)) / (len(xs) - 1)
 
 
 def variance(xs: Sequence[float]) -> float:
     if len(xs) < 2:
         return 0.0
-    x_bar = mean(xs)
+    x_bar = sum(xs) / len(xs)
     return sum((x - x_bar) ** 2 for x in xs) / (len(xs) - 1)
 
 
 def beta_to_benchmark(asset_returns: Dict[date, float], benchmark_returns: Dict[date, float]) -> float:
-    xs, ys = align_returns(asset_returns, benchmark_returns)
-    var = variance(ys)
-    if var == 0:
+    dates = sorted(set(asset_returns).intersection(benchmark_returns))
+    count = len(dates)
+    if count < 2:
         return 0.0
-    return covariance(xs, ys) / var
+    sum_x = 0.0
+    sum_y = 0.0
+    sum_xy = 0.0
+    sum_y2 = 0.0
+    for day in dates:
+        x_value = asset_returns[day]
+        y_value = benchmark_returns[day]
+        sum_x += x_value
+        sum_y += y_value
+        sum_xy += x_value * y_value
+        sum_y2 += y_value * y_value
+    variance_numerator = sum_y2 - (sum_y * sum_y / count)
+    if variance_numerator == 0:
+        return 0.0
+    covariance_numerator = sum_xy - (sum_x * sum_y / count)
+    return covariance_numerator / variance_numerator
 
 
 def period_key(day: date, frequency: str) -> Tuple[int, int]:
@@ -79,8 +93,19 @@ def period_key(day: date, frequency: str) -> Tuple[int, int]:
 def period_end_points(points: Sequence[PricePoint], frequency: str) -> List[PricePoint]:
     if frequency not in FREQUENCIES:
         raise ValueError(f"unsupported frequency: {frequency}")
+    ordered = sorted(points, key=lambda p: p.day)
+    if frequency == "daily":
+        endpoints: List[PricePoint] = []
+        last_day = None
+        for point in ordered:
+            if point.day == last_day:
+                endpoints[-1] = point
+            else:
+                endpoints.append(point)
+                last_day = point.day
+        return endpoints
     by_period: Dict[Tuple[int, int], PricePoint] = {}
-    for point in sorted(points, key=lambda p: p.day):
+    for point in ordered:
         by_period[period_key(point.day, frequency)] = point
     return [by_period[key] for key in sorted(by_period)]
 
@@ -99,7 +124,7 @@ def estimated_tax_loss_alpha(points: Sequence[PricePoint], frequency: str) -> fl
     if not returns:
         return 0.0
     losses = [max(0.0, -period_return) for period_return in returns]
-    return mean(losses) * FREQUENCIES[frequency]
+    return (sum(losses) / len(losses)) * FREQUENCIES[frequency]
 
 
 def simulated_tax_alpha(
@@ -141,7 +166,7 @@ def simulated_tax_alpha(
         basis = value
 
     years = max((endpoints[-1].day - endpoints[0].day).days / 365.25, 1.0 / FREQUENCIES[frequency])
-    average_capital = mean(point.adj_close for point in endpoints)
+    average_capital = sum(point.adj_close for point in endpoints) / len(endpoints)
     if average_capital <= 0:
         return 0.0
     return total_net_benefit / average_capital / years

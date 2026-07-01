@@ -45,6 +45,122 @@ class TrackingModel:
     annualization: float = 252.0
 
 
+class _TrackingArrayCache:
+    def __init__(
+        self,
+        candidates: Sequence[Candidate],
+        benchmark_returns: Mapping[date, float],
+    ) -> None:
+        self.ticker_to_index = {candidate.ticker: idx for idx, candidate in enumerate(candidates)}
+        date_set = set(benchmark_returns)
+        for candidate in candidates:
+            if candidate.returns:
+                date_set.update(candidate.returns)
+        self.dates = sorted(date_set)
+        date_index = {day: idx for idx, day in enumerate(self.dates)}
+
+        self.benchmark = np.full(len(self.dates), np.nan, dtype=float)
+        for day, value in benchmark_returns.items():
+            idx = date_index.get(day)
+            if idx is not None:
+                self.benchmark[idx] = float(value)
+
+        self.asset_returns = np.full((len(candidates), len(self.dates)), np.nan, dtype=float)
+        for row, candidate in enumerate(candidates):
+            if not candidate.returns:
+                continue
+            for day, value in candidate.returns.items():
+                idx = date_index.get(day)
+                if idx is not None:
+                    self.asset_returns[row, idx] = float(value)
+
+    def active_variance(
+        self,
+        candidates: Sequence[Candidate],
+        weights: Sequence[float],
+    ) -> Optional[Tuple[float, int]]:
+        if len(candidates) == 0:
+            return None
+        indices = []
+        for candidate in candidates:
+            idx = self.ticker_to_index.get(candidate.ticker)
+            if idx is None:
+                return None
+            indices.append(idx)
+        asset_rows = self.asset_returns[np.asarray(indices, dtype=int)]
+        valid = np.isfinite(self.benchmark) & np.all(np.isfinite(asset_rows), axis=0)
+        observations = int(np.count_nonzero(valid))
+        if observations < 2:
+            return None
+        weight_array = np.asarray(weights, dtype=float)
+        portfolio_returns = weight_array @ asset_rows[:, valid]
+        active_returns = portfolio_returns - self.benchmark[valid]
+        return float(np.var(active_returns, ddof=1)), observations
+
+    def tracking_error(
+        self,
+        candidates: Sequence[Candidate],
+        weights: Sequence[float],
+        annualization: float = 252.0,
+    ) -> Optional[Tuple[float, int]]:
+        result = self.active_variance(candidates, weights)
+        if result is None:
+            return None
+        active_variance, observations = result
+        return math.sqrt(max(active_variance, 0.0) * annualization), observations
+
+
+class _ReturnCorrelationCache:
+    def __init__(self, candidates: Sequence[Candidate]) -> None:
+        self.ticker_to_index = {candidate.ticker: idx for idx, candidate in enumerate(candidates)}
+        date_set: Set[date] = set()
+        for candidate in candidates:
+            if candidate.returns:
+                date_set.update(candidate.returns)
+        self.dates = sorted(date_set)
+        date_index = {day: idx for idx, day in enumerate(self.dates)}
+        self.asset_returns = np.full((len(candidates), len(self.dates)), np.nan, dtype=float)
+        for row, candidate in enumerate(candidates):
+            if not candidate.returns:
+                continue
+            for day, value in candidate.returns.items():
+                idx = date_index.get(day)
+                if idx is not None:
+                    self.asset_returns[row, idx] = float(value)
+        self.cache: Dict[Tuple[str, str], float] = {}
+
+    def correlation(self, left: Candidate, right: Candidate) -> float:
+        key = tuple(sorted((left.ticker, right.ticker)))
+        cached = self.cache.get(key)
+        if cached is not None:
+            return cached
+        left_idx = self.ticker_to_index.get(left.ticker)
+        right_idx = self.ticker_to_index.get(right.ticker)
+        if left_idx is None or right_idx is None:
+            value = _return_correlation(left.returns, right.returns)
+            self.cache[key] = value
+            return value
+        left_values = self.asset_returns[left_idx]
+        right_values = self.asset_returns[right_idx]
+        valid = np.isfinite(left_values) & np.isfinite(right_values)
+        if int(np.count_nonzero(valid)) < 2:
+            self.cache[key] = 0.0
+            return 0.0
+        left_common = left_values[valid]
+        right_common = right_values[valid]
+        left_centered = left_common - float(np.mean(left_common))
+        right_centered = right_common - float(np.mean(right_common))
+        left_variance = float(left_centered @ left_centered)
+        right_variance = float(right_centered @ right_centered)
+        denominator = math.sqrt(left_variance * right_variance)
+        if denominator <= 0:
+            self.cache[key] = 0.0
+            return 0.0
+        value = max(min(float(left_centered @ right_centered) / denominator, 1.0), -1.0)
+        self.cache[key] = value
+        return value
+
+
 @dataclass(frozen=True)
 class SimulatedHarvestLot:
     ticker: str
@@ -309,9 +425,10 @@ def _sector_exposure_arrays(
     if not target_sectors:
         return None, None
     sector_names = sorted(set(target_sectors).union(candidate.sector for candidate in candidates))
+    sector_index = {sector: idx for idx, sector in enumerate(sector_names)}
     matrix = np.zeros((len(sector_names), len(candidates)), dtype=float)
     for column, candidate in enumerate(candidates):
-        matrix[sector_names.index(candidate.sector), column] = 1.0
+        matrix[sector_index[candidate.sector], column] = 1.0
     targets = np.asarray([target_sectors.get(sector, 0.0) for sector in sector_names], dtype=float)
     return matrix, targets
 
@@ -335,25 +452,37 @@ def objective_value(
     tax_penalty: float = 1.0,
     sector_penalty: float = 1.0,
     concentration_penalty: float = 0.01,
+    tracking_cache: Optional[_TrackingArrayCache] = None,
 ) -> float:
     if tax_alpha_mode not in {"closest", "at-least"}:
         raise ValueError("tax_alpha_mode must be closest or at-least")
     if error_margin <= 0:
         raise ValueError("error_margin must be positive")
-    tracking_model = prepare_tracking_model(candidates, benchmark_returns)
-    if tracking_model is None:
-        raise ValueError("benchmark returns and candidate returns are required to optimize error margin")
-    metrics = portfolio_metrics(candidates, weights, tracking_model=tracking_model)
+    tracking_error_value: float
+    if tracking_cache is not None:
+        cached_tracking = tracking_cache.tracking_error(candidates, weights)
+        if cached_tracking is None:
+            raise ValueError("benchmark returns and candidate returns are required to optimize error margin")
+        tracking_error_value, _ = cached_tracking
+        tax_alpha = sum(weight * candidate.tax_alpha for weight, candidate in zip(weights, candidates))
+        sectors = _sector_vector(candidates, weights)
+    else:
+        tracking_model = prepare_tracking_model(candidates, benchmark_returns)
+        if tracking_model is None:
+            raise ValueError("benchmark returns and candidate returns are required to optimize error margin")
+        metrics = portfolio_metrics(candidates, weights, tracking_model=tracking_model)
+        tracking_error_value = float(metrics["tracking_error"])
+        tax_alpha = float(metrics["estimated_tax_loss_alpha"])
+        sectors = metrics["sectors"]
     tracking_error_scale = max(error_margin, 0.005)
     tax_scale = max(abs(target_tax_alpha), 0.005)
-    tracking_error_residual = float(metrics["tracking_error"]) / tracking_error_scale
-    tax_delta = float(metrics["estimated_tax_loss_alpha"]) - target_tax_alpha
+    tracking_error_residual = tracking_error_value / tracking_error_scale
+    tax_delta = tax_alpha - target_tax_alpha
     if tax_alpha_mode == "at-least":
         tax_delta = min(tax_delta, 0.0)
     tax_residual = tax_delta / tax_scale
     value = tracking_error_penalty * tracking_error_residual**2 + tax_penalty * tax_residual**2
     if target_sectors:
-        sectors = metrics["sectors"]
         all_sectors = set(target_sectors).union(sectors)
         value += sector_penalty * sum(
             (float(sectors.get(sector, 0.0)) - target_sectors.get(sector, 0.0)) ** 2
@@ -376,17 +505,26 @@ def candidate_score(
     target_tax_alpha: float,
     benchmark_returns: Dict[date, float],
     tax_alpha_mode: str = "closest",
+    tracking_cache: Optional[_TrackingArrayCache] = None,
 ) -> float:
     if tax_alpha_mode not in {"closest", "at-least"}:
         raise ValueError("tax_alpha_mode must be closest or at-least")
     if error_margin <= 0:
         raise ValueError("error_margin must be positive")
-    tracking_model = prepare_tracking_model([candidate], benchmark_returns)
-    if tracking_model is None:
-        error_score = float("inf")
+    error_scale = max(error_margin, 0.005)
+    if tracking_cache is not None:
+        cached_tracking = tracking_cache.tracking_error([candidate], [1.0])
+        error_score = (
+            (cached_tracking[0] / error_scale) ** 2
+            if cached_tracking is not None
+            else float("inf")
+        )
     else:
-        error_scale = max(error_margin, 0.005)
-        error_score = (tracking_error([1.0], tracking_model) / error_scale) ** 2
+        tracking_model = prepare_tracking_model([candidate], benchmark_returns)
+        if tracking_model is None:
+            error_score = float("inf")
+        else:
+            error_score = (tracking_error([1.0], tracking_model) / error_scale) ** 2
     tax_scale = max(abs(target_tax_alpha), 0.005)
     tax_delta = candidate.tax_alpha - target_tax_alpha
     if tax_alpha_mode == "at-least":
@@ -430,6 +568,7 @@ def initial_selection(
     target_sectors: Optional[Dict[str, float]],
     tax_alpha_mode: str = "closest",
     index_weight_priority: bool = False,
+    tracking_cache: Optional[_TrackingArrayCache] = None,
 ) -> List[Candidate]:
     if sample_size <= 0:
         raise ValueError("sample_size must be positive")
@@ -442,7 +581,14 @@ def initial_selection(
         sorted_candidates = sorted(
             candidates,
             key=lambda candidate: (
-                candidate_score(candidate, error_margin, target_tax_alpha, benchmark_returns, tax_alpha_mode),
+                candidate_score(
+                    candidate,
+                    error_margin,
+                    target_tax_alpha,
+                    benchmark_returns,
+                    tax_alpha_mode,
+                    tracking_cache=tracking_cache,
+                ),
                 -candidate.index_weight,
             ),
         )
@@ -484,8 +630,11 @@ def optimize_selection(
     random_seed: int = 7,
     show_progress: bool = False,
     progress_label: str = "Selection",
+    tracking_cache: Optional[_TrackingArrayCache] = None,
 ) -> List[Candidate]:
     rng = random.Random(random_seed)
+    if tracking_cache is None:
+        tracking_cache = _TrackingArrayCache(candidates, benchmark_returns)
     selected_by_ticker = {candidate.ticker: candidate for candidate in selected}
     universe_by_ticker = {candidate.ticker: candidate for candidate in candidates}
     by_sector: Dict[str, List[Candidate]] = {}
@@ -503,6 +652,7 @@ def optimize_selection(
             benchmark_returns=benchmark_returns,
             tax_alpha_mode=tax_alpha_mode,
             sector_penalty=2.0 if match_sectors else 0.0,
+            tracking_cache=tracking_cache,
         )
 
     best_selection = list(selected_by_ticker.values())
@@ -734,13 +884,21 @@ def _return_correlation(
     return max(min(covariance_value / denominator, 1.0), -1.0)
 
 
-def _replacement_similarity(source: Candidate, replacement: Candidate) -> Dict[str, float]:
+def _replacement_similarity(
+    source: Candidate,
+    replacement: Candidate,
+    correlation_cache: Optional[_ReturnCorrelationCache] = None,
+) -> Dict[str, float]:
     same_industry = (
         source.industry != "Unknown"
         and replacement.industry != "Unknown"
         and source.industry == replacement.industry
     )
-    correlation = _return_correlation(source.returns, replacement.returns)
+    correlation = (
+        correlation_cache.correlation(source, replacement)
+        if correlation_cache is not None
+        else _return_correlation(source.returns, replacement.returns)
+    )
     beta_delta = abs(source.beta - replacement.beta)
     industry_penalty = 0.0 if same_industry else 1.0
     score = 3.0 * industry_penalty + beta_delta + (1.0 - correlation)
@@ -762,12 +920,11 @@ def replacement_candidates(
     limit: int = 5,
 ) -> Dict[str, List[Dict[str, object]]]:
     selected_tickers = {candidate.ticker for candidate in selected}
-    by_sector: Dict[str, List[Candidate]] = {}
-    for candidate in universe:
-        if candidate.ticker not in selected_tickers:
-            by_sector.setdefault(candidate.sector, []).append(candidate)
     replacements: Dict[str, List[Dict[str, object]]] = {}
+    tracking_cache = _TrackingArrayCache(universe, benchmark_returns)
     score_cache: Dict[str, float] = {}
+    replacement_scores: Dict[Tuple[str, str], Dict[str, float]] = {}
+    correlation_cache = _ReturnCorrelationCache(universe)
 
     def score_candidate(candidate: Candidate) -> float:
         if candidate.ticker not in score_cache:
@@ -777,27 +934,37 @@ def replacement_candidates(
                 target_tax_alpha,
                 benchmark_returns,
                 tax_alpha_mode,
+                tracking_cache=tracking_cache,
             )
         return score_cache[candidate.ticker]
 
+    candidate_scores = {candidate.ticker: score_candidate(candidate) for candidate in universe}
+    ranked_replacements = _ranked_same_sector_replacements(
+        universe,
+        candidate_scores,
+        replacement_scores,
+        correlation_cache,
+    )
+
     for candidate in selected:
-        pool = sorted(
-            by_sector.get(candidate.sector, []),
-            key=lambda item: (
-                _replacement_similarity(candidate, item)["score"],
-                score_candidate(item),
-                -item.index_weight,
-            ),
-        )
+        pool = [
+            item
+            for item in ranked_replacements.get(candidate.ticker, [])
+            if item.ticker not in selected_tickers
+        ]
         replacements[candidate.ticker] = [
-            _replacement_row(candidate, item)
+            _replacement_row(candidate, item, correlation_cache)
             for item in pool[:limit]
         ]
     return replacements
 
 
-def _replacement_row(source: Candidate, replacement: Candidate) -> Dict[str, object]:
-    similarity = _replacement_similarity(source, replacement)
+def _replacement_row(
+    source: Candidate,
+    replacement: Candidate,
+    correlation_cache: Optional[_ReturnCorrelationCache] = None,
+) -> Dict[str, object]:
+    similarity = _replacement_similarity(source, replacement, correlation_cache)
     return {
         "ticker": replacement.ticker,
         "sector": replacement.sector,
@@ -959,11 +1126,37 @@ def _cached_replacement_similarity(
     source: Candidate,
     replacement: Candidate,
     cache: Dict[Tuple[str, str], Dict[str, float]],
+    correlation_cache: Optional[_ReturnCorrelationCache] = None,
 ) -> Dict[str, float]:
     key = (source.ticker, replacement.ticker)
     if key not in cache:
-        cache[key] = _replacement_similarity(source, replacement)
+        cache[key] = _replacement_similarity(source, replacement, correlation_cache)
     return cache[key]
+
+
+def _ranked_same_sector_replacements(
+    universe: Sequence[Candidate],
+    candidate_scores: Mapping[str, float],
+    replacement_scores: Dict[Tuple[str, str], Dict[str, float]],
+    correlation_cache: Optional[_ReturnCorrelationCache] = None,
+) -> Dict[str, List[Candidate]]:
+    by_sector: Dict[str, List[Candidate]] = {}
+    for candidate in universe:
+        by_sector.setdefault(candidate.sector, []).append(candidate)
+
+    rankings: Dict[str, List[Candidate]] = {}
+    for source in universe:
+        pool = [candidate for candidate in by_sector.get(source.sector, []) if candidate.ticker != source.ticker]
+        pool.sort(
+            key=lambda candidate: (
+                _cached_replacement_similarity(source, candidate, replacement_scores, correlation_cache)["score"],
+                candidate_scores.get(candidate.ticker, float("inf")),
+                -candidate.index_weight,
+                candidate.ticker,
+            )
+        )
+        rankings[source.ticker] = pool
+    return rankings
 
 
 def _active_historical_holdings(
@@ -1003,21 +1196,75 @@ def _same_sector_replacements(
     replacement_scores: Dict[Tuple[str, str], Dict[str, float]],
     replacement_count: int,
     active_tickers: Optional[Set[str]] = None,
+    ranked_replacements: Optional[Mapping[str, Sequence[Candidate]]] = None,
+    correlation_cache: Optional[_ReturnCorrelationCache] = None,
+    relaxed_unavailable: Optional[Set[str]] = None,
+    day_prices: Optional[Mapping[str, float]] = None,
 ) -> List[Candidate]:
     if replacement_count <= 0:
         return []
-    unavailable_upper = {ticker.upper() for ticker in unavailable}
+    unavailable_tickers = unavailable
+    relaxed_unavailable_tickers = relaxed_unavailable
+    if ranked_replacements is not None:
+        replacements: List[Candidate] = []
+        relaxed_replacements: List[Candidate] = []
+        for candidate in ranked_replacements.get(source.ticker, []):
+            price = (
+                day_prices.get(candidate.ticker, 0.0)
+                if day_prices is not None
+                else price_table.get(candidate.ticker, {}).get(day, 0.0)
+            )
+            if (
+                (active_tickers is not None and candidate.ticker not in active_tickers)
+                or price <= 0
+            ):
+                continue
+            if candidate.ticker not in unavailable_tickers:
+                replacements.append(candidate)
+                if len(replacements) >= replacement_count:
+                    break
+            if (
+                relaxed_unavailable_tickers is not None
+                and candidate.ticker not in relaxed_unavailable_tickers
+                and len(relaxed_replacements) < replacement_count
+            ):
+                relaxed_replacements.append(candidate)
+        if replacements:
+            return replacements
+        if relaxed_unavailable_tickers is not None:
+            return relaxed_replacements
+        return replacements
+
     pool = [
         candidate
         for candidate in universe
         if candidate.sector == source.sector
-        and candidate.ticker not in unavailable_upper
+        and candidate.ticker not in unavailable_tickers
         and (active_tickers is None or candidate.ticker in active_tickers)
-        and price_table.get(candidate.ticker, {}).get(day, 0.0) > 0
+        and (
+            day_prices.get(candidate.ticker, 0.0)
+            if day_prices is not None
+            else price_table.get(candidate.ticker, {}).get(day, 0.0)
+        )
+        > 0
     ]
+    if not pool and relaxed_unavailable_tickers is not None:
+        pool = [
+            candidate
+            for candidate in universe
+            if candidate.sector == source.sector
+            and candidate.ticker not in relaxed_unavailable_tickers
+            and (active_tickers is None or candidate.ticker in active_tickers)
+            and (
+                day_prices.get(candidate.ticker, 0.0)
+                if day_prices is not None
+                else price_table.get(candidate.ticker, {}).get(day, 0.0)
+            )
+            > 0
+        ]
     pool.sort(
         key=lambda candidate: (
-            _cached_replacement_similarity(source, candidate, replacement_scores)["score"],
+            _cached_replacement_similarity(source, candidate, replacement_scores, correlation_cache)["score"],
             candidate_scores.get(candidate.ticker, float("inf")),
             -candidate.index_weight,
             candidate.ticker,
@@ -1180,6 +1427,7 @@ def simulate_portfolio_harvests(
 
     tickers = {candidate.ticker for candidate in universe}.union(candidate.ticker for candidate in selected)
     table = _price_table(tickers, prices, schedule)
+    tracking_cache = _TrackingArrayCache(universe, benchmark_returns)
     candidate_scores = {
         candidate.ticker: candidate_score(
             candidate,
@@ -1187,11 +1435,19 @@ def simulate_portfolio_harvests(
             target_tax_alpha,
             benchmark_returns,
             tax_alpha_mode,
+            tracking_cache=tracking_cache,
         )
         for candidate in universe
     }
     candidate_by_ticker = {candidate.ticker: candidate for candidate in universe}
     replacement_scores: Dict[Tuple[str, str], Dict[str, float]] = {}
+    correlation_cache = _ReturnCorrelationCache(universe)
+    ranked_replacements = _ranked_same_sector_replacements(
+        universe,
+        candidate_scores,
+        replacement_scores,
+        correlation_cache,
+    )
     selected_pairs = [
         (candidate, max(0.0, weight))
         for candidate, weight in zip(selected, weights)
@@ -1248,9 +1504,14 @@ def simulate_portfolio_harvests(
     rebalance_dates: List[str] = []
 
     for day_index, day in enumerate(simulation_dates):
+        day_prices = {
+            ticker: price
+            for ticker, lookup in table.items()
+            if (price := lookup.get(day, 0.0)) > 0
+        }
         portfolio_value = 0.0
         for lot in lots:
-            price = table.get(lot.ticker, {}).get(day)
+            price = day_prices.get(lot.ticker)
             if price is not None:
                 portfolio_value += lot.shares * price
         portfolio_values.append(portfolio_value)
@@ -1263,9 +1524,14 @@ def simulate_portfolio_harvests(
             next_lots: List[SimulatedHarvestLot] = []
             next_lot_tickers: Set[str] = set()
             lot_tickers = {lot.ticker for lot in lots}
+            banned_tickers = {
+                ticker
+                for ticker, banned_day in banned_until.items()
+                if banned_day >= day
+            }
             sold_this_period: Set[str] = set()
             for lot in lots:
-                price = table.get(lot.ticker, {}).get(day)
+                price = day_prices.get(lot.ticker)
                 if price is None or price <= 0 or lot.basis <= 0:
                     next_lots.append(lot)
                     next_lot_tickers.add(lot.ticker)
@@ -1288,17 +1554,13 @@ def simulate_portfolio_harvests(
                     next_lot_tickers.add(lot.ticker)
                     continue
 
-                banned_tickers = {
-                    ticker
-                    for ticker, banned_day in banned_until.items()
-                    if banned_day >= day
-                }
                 unavailable = lot_tickers.union(next_lot_tickers, banned_tickers, sold_this_period, {lot.ticker})
                 source_candidate = candidate_by_ticker.get(lot.ticker)
                 if source_candidate is None:
                     next_lots.append(lot)
                     next_lot_tickers.add(lot.ticker)
                     continue
+                relaxed_unavailable = banned_tickers.union(sold_this_period, {lot.ticker})
                 replacements = _same_sector_replacements(
                     universe,
                     source_candidate,
@@ -1309,23 +1571,14 @@ def simulate_portfolio_harvests(
                     replacement_scores,
                     replacement_count,
                     active_tickers=pit_active_tickers,
+                    ranked_replacements=ranked_replacements,
+                    correlation_cache=correlation_cache,
+                    relaxed_unavailable=relaxed_unavailable,
+                    day_prices=day_prices,
                 )
-                if not replacements:
-                    relaxed_unavailable = banned_tickers.union(sold_this_period, {lot.ticker})
-                    replacements = _same_sector_replacements(
-                        universe,
-                        source_candidate,
-                        relaxed_unavailable,
-                        table,
-                        day,
-                        candidate_scores,
-                        replacement_scores,
-                        replacement_count,
-                        active_tickers=pit_active_tickers,
-                    )
                 allocation_plan: List[Tuple[Candidate, float, float]] = []
                 for replacement, allocation in _replacement_allocations(replacements, market_value):
-                    replacement_price = table.get(replacement.ticker, {}).get(day)
+                    replacement_price = day_prices.get(replacement.ticker)
                     if replacement_price and replacement_price > 0 and allocation > 0:
                         allocation_plan.append((replacement, allocation, replacement_price))
                 if not allocation_plan:
@@ -1341,6 +1594,7 @@ def simulate_portfolio_harvests(
                 harvest_count += 1
                 sold_this_period.add(lot.ticker)
                 banned_until[lot.ticker] = day + timedelta(days=wash_sale_days)
+                banned_tickers.add(lot.ticker)
                 period = period_rows.setdefault(
                     day,
                     {
@@ -1361,7 +1615,12 @@ def simulate_portfolio_harvests(
 
                 replacement_event_rows: List[Dict[str, object]] = []
                 for replacement, allocation, replacement_price in allocation_plan:
-                    similarity = _cached_replacement_similarity(source_candidate, replacement, replacement_scores)
+                    similarity = _cached_replacement_similarity(
+                        source_candidate,
+                        replacement,
+                        replacement_scores,
+                        correlation_cache,
+                    )
                     next_lots.append(
                         SimulatedHarvestLot(
                             ticker=replacement.ticker,
@@ -1525,6 +1784,7 @@ def construct_portfolio(
         raise ValueError("benchmark_returns are required to optimize error margin")
     tax_frequency = harvest_frequency or rebalance_frequency
     targets = sector_targets(holdings) if match_sectors else None
+    tracking_cache = _TrackingArrayCache(candidates, benchmark_returns)
     initial = initial_selection(
         candidates,
         sample_size,
@@ -1535,6 +1795,7 @@ def construct_portfolio(
         targets,
         tax_alpha_mode=tax_alpha_mode,
         index_weight_priority=False,
+        tracking_cache=tracking_cache,
     )
     selected = optimize_selection(
         candidates,
@@ -1550,6 +1811,7 @@ def construct_portfolio(
         random_seed=random_seed,
         show_progress=show_progress,
         progress_label=f"{progress_label} selection",
+        tracking_cache=tracking_cache,
     )
     weights = optimize_weights(
         selected,

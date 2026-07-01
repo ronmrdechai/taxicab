@@ -35,7 +35,11 @@ class PricePoint:
 
 
 def parse_date(value: str) -> date:
-    return datetime.strptime(value.strip(), "%Y-%m-%d").date()
+    text = value.strip()
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return datetime.strptime(text, "%Y-%m-%d").date()
 
 
 def today_utc() -> date:
@@ -543,28 +547,34 @@ def write_prices_csv(
 
 def read_prices_csv(path: os.PathLike[str] | str) -> Dict[str, List[PricePoint]]:
     with open(path, newline="", encoding="utf-8-sig") as handle:
-        reader = csv.DictReader(handle)
-        if not reader.fieldnames:
+        reader = csv.reader(handle)
+        try:
+            fieldnames = next(reader)
+        except StopIteration:
             raise ValueError(f"{path} has no header row")
-        columns = _column_lookup(reader.fieldnames)
+        columns = _column_lookup(fieldnames)
         date_col = _first_column(columns, ["date", "day"])
         ticker_col = _first_column(columns, ["ticker", "symbol"])
         price_col = _first_column(columns, ["adj_close", "adjusted close", "close", "price"])
         if not date_col or not ticker_col or not price_col:
             raise ValueError(f"{path} needs date, ticker, and adj_close columns")
+        date_idx = fieldnames.index(date_col)
+        ticker_idx = fieldnames.index(ticker_col)
+        price_idx = fieldnames.index(price_col)
 
         prices: Dict[str, List[PricePoint]] = {}
         for row in reader:
-            ticker = normalize_ticker(row.get(ticker_col, ""))
+            ticker = normalize_ticker(row[ticker_idx] if ticker_idx < len(row) else "")
             if not ticker:
                 continue
-            raw_price = (row.get(price_col) or "").strip().replace(",", "")
+            raw_price = (row[price_idx] if price_idx < len(row) else "").strip().replace(",", "")
             if not raw_price:
                 continue
             price = float(raw_price)
             if price <= 0 or not math.isfinite(price):
                 continue
-            prices.setdefault(ticker, []).append(PricePoint(parse_date(row[date_col]), price))
+            raw_day = row[date_idx] if date_idx < len(row) else ""
+            prices.setdefault(ticker, []).append(PricePoint(parse_date(raw_day), price))
 
     for ticker, points in prices.items():
         prices[ticker] = sorted(points, key=lambda p: p.day)
