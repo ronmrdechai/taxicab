@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=58", "wheel>=0.37"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "taxicab"
+version = "0.1.0"
+description = "Command-line direct indexing optimizer for tracking-error targeting and estimated tax-loss alpha."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "TaxiCab" }]
+dependencies = ["numpy>=2.0", "tqdm>=4.66"]
+
+[project.scripts]
+taxicab = "taxicab.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
