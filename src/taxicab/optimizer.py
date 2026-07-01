@@ -130,7 +130,8 @@ class _ReturnCorrelationCache:
         self.cache: Dict[Tuple[str, str], float] = {}
 
     def correlation(self, left: Candidate, right: Candidate) -> float:
-        key = tuple(sorted((left.ticker, right.ticker)))
+        left_ticker, right_ticker = sorted((left.ticker, right.ticker))
+        key = (left_ticker, right_ticker)
         cached = self.cache.get(key)
         if cached is not None:
             return cached
@@ -173,7 +174,7 @@ class SimulatedHarvestLot:
 
 def build_candidates(
     holdings: Sequence[Holding],
-    prices: Dict[str, Sequence[PricePoint]],
+    prices: Mapping[str, Sequence[PricePoint]],
     benchmark_ticker: str,
     rebalance_frequency: str,
     min_observations: int = 252,
@@ -351,7 +352,7 @@ def _adjust_bounded_sum(values: Sequence[float], adjustment: float, lower: float
 
 def prepare_tracking_model(
     candidates: Sequence[Candidate],
-    benchmark_returns: Optional[Dict[date, float]],
+    benchmark_returns: Optional[Mapping[date, float]],
     annualization: float = 252.0,
 ) -> Optional[TrackingModel]:
     if not benchmark_returns:
@@ -391,12 +392,12 @@ def prepare_tracking_model(
     )
 
 
-def tracking_error(weights: Sequence[float], model: TrackingModel) -> float:
+def tracking_error(weights: Sequence[float] | np.ndarray, model: TrackingModel) -> float:
     active_variance = _active_variance(weights, model)
     return math.sqrt(max(active_variance, 0.0) * model.annualization)
 
 
-def _active_variance(weights: Sequence[float], model: TrackingModel) -> float:
+def _active_variance(weights: Sequence[float] | np.ndarray, model: TrackingModel) -> float:
     weight_array = np.asarray(weights, dtype=float)
     return float(
         weight_array @ model.covariance_matrix @ weight_array
@@ -405,7 +406,7 @@ def _active_variance(weights: Sequence[float], model: TrackingModel) -> float:
     )
 
 
-def _active_variance_gradient(weights: Sequence[float], model: TrackingModel) -> List[float]:
+def _active_variance_gradient(weights: Sequence[float] | np.ndarray, model: TrackingModel) -> List[float]:
     weight_array = np.asarray(weights, dtype=float)
     gradient = 2.0 * (model.covariance_matrix @ weight_array - model.asset_benchmark_covariance)
     return gradient.tolist()
@@ -470,10 +471,9 @@ def objective_value(
         tracking_model = prepare_tracking_model(candidates, benchmark_returns)
         if tracking_model is None:
             raise ValueError("benchmark returns and candidate returns are required to optimize error margin")
-        metrics = portfolio_metrics(candidates, weights, tracking_model=tracking_model)
-        tracking_error_value = float(metrics["tracking_error"])
-        tax_alpha = float(metrics["estimated_tax_loss_alpha"])
-        sectors = metrics["sectors"]
+        tracking_error_value = tracking_error(weights, tracking_model)
+        tax_alpha = sum(weight * candidate.tax_alpha for weight, candidate in zip(weights, candidates))
+        sectors = _sector_vector(candidates, weights)
     tracking_error_scale = max(error_margin, 0.005)
     tax_scale = max(abs(target_tax_alpha), 0.005)
     tracking_error_residual = tracking_error_value / tracking_error_scale
@@ -832,8 +832,8 @@ def optimize_weights(
 
 
 def _repair_tracking_error(
-    weights: Sequence[float],
-    anchor_weights: Sequence[float],
+    weights: Sequence[float] | np.ndarray,
+    anchor_weights: Sequence[float] | np.ndarray,
     tracking_model: TrackingModel,
     error_margin: float,
 ) -> List[float]:
@@ -1833,7 +1833,7 @@ def construct_portfolio(
     metrics["active_share"] = active_share(selected, weights, holdings)
     sector_targets_out = targets or {}
     if sector_targets_out:
-        metrics["sector_abs_error"] = sector_error(metrics["sectors"], sector_targets_out)
+        metrics["sector_abs_error"] = sector_error(_sector_vector(selected, weights), sector_targets_out)
 
     positions = []
     for candidate, weight in sorted(zip(selected, weights), key=lambda item: item[1], reverse=True):

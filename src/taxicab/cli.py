@@ -4,7 +4,7 @@ import argparse
 from datetime import datetime, timezone
 from pathlib import Path
 import sys
-from typing import Dict, Optional, Sequence
+from typing import Dict, List, Mapping, Optional, Sequence, cast
 
 from tqdm.auto import tqdm
 
@@ -18,6 +18,7 @@ from .data import (
     latest_historical_holdings,
     load_holdings_source,
     parse_date,
+    PricePoint,
     read_historical_holdings_cache,
     read_historical_holdings_csv,
     read_cache,
@@ -315,7 +316,7 @@ def command_download(args: argparse.Namespace) -> int:
     if args.sector_source != "none":
         print(f"Sector enrichment complete; failures: {len(sector_failures)}", flush=True)
 
-    prices: Dict[str, object] = read_prices_csv(args.prices_csv) if args.prices_csv else {}
+    prices: Dict[str, List[PricePoint]] = read_prices_csv(args.prices_csv) if args.prices_csv else {}
     failures: Dict[str, str] = {}
     benchmark = args.index.upper()
     print(f"Downloading benchmark prices for {benchmark}", flush=True)
@@ -640,8 +641,8 @@ def command_compare(args: argparse.Namespace) -> int:
     if not benchmark:
         raise ValueError("metadata.json is missing index")
 
-    portfolios = {}
-    sources = {}
+    portfolios: Dict[str, Mapping[str, object]] = {}
+    sources: Dict[str, str] = {}
     for raw in args.portfolio:
         label, path = parse_labeled_path(raw)
         if label in portfolios:
@@ -649,7 +650,7 @@ def command_compare(args: argparse.Namespace) -> int:
         state = read_json(path)
         if not isinstance(state, dict):
             raise ValueError(f"{path} must contain a portfolio JSON object")
-        portfolios[label] = state
+        portfolios[label] = cast(Dict[str, object], state)
         sources[label] = str(path)
 
     comparison = compare_portfolios(portfolios, holdings, prices, benchmark)
@@ -705,23 +706,33 @@ def print_comparison_summary(comparison) -> None:
 
 
 def format_pct(value: object) -> str:
-    try:
-        return "{:.2f}%".format(float(value) * 100.0)
-    except (TypeError, ValueError):
+    number = _float_or_none(value)
+    if number is None:
         return "n/a"
+    return "{:.2f}%".format(number * 100.0)
 
 
 def format_number(value: object) -> str:
-    try:
-        return "{:.4f}".format(float(value))
-    except (TypeError, ValueError):
+    number = _float_or_none(value)
+    if number is None:
         return "n/a"
+    return "{:.4f}".format(number)
+
+
+def _float_or_none(value: object) -> Optional[float]:
+    if not isinstance(value, (int, float, str)):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def command_rebalance(args: argparse.Namespace) -> int:
     state = read_json(args.state)
     if not isinstance(state, dict):
         raise ValueError("state JSON must contain an object")
+    state = cast(Dict[str, object], state)
     current = read_current_positions(args.current_csv)
     operations = plan_rebalance(
         state,

@@ -1,6 +1,7 @@
 import unittest
 
 from datetime import date, timedelta
+from typing import Dict, List, cast
 
 import numpy as np
 
@@ -19,11 +20,29 @@ from taxicab.optimizer import (
 )
 
 
-def returns(values):
+JsonObject = Dict[str, object]
+
+
+def returns(values: List[float]) -> Dict[date, float]:
     return {
         date(2021, 1, 1) + timedelta(days=idx): value
         for idx, value in enumerate(values)
     }
+
+
+def object_list(value: object) -> List[JsonObject]:
+    assert isinstance(value, list)
+    return cast(List[JsonObject], value)
+
+
+def object_map(value: object) -> JsonObject:
+    assert isinstance(value, dict)
+    return cast(JsonObject, value)
+
+
+def number(value: object) -> float:
+    assert isinstance(value, (int, float))
+    return float(value)
 
 
 class OptimizerTests(unittest.TestCase):
@@ -47,6 +66,7 @@ class OptimizerTests(unittest.TestCase):
         self.assertTrue(all(value <= 0.6 for value in projected))
 
     def test_tracking_error_is_zero_for_benchmark_like_returns(self):
+        benchmark_returns = returns([0.01, -0.02, 0.03])
         candidates = [
             Candidate(
                 "A",
@@ -54,10 +74,9 @@ class OptimizerTests(unittest.TestCase):
                 "Tech",
                 beta=1.0,
                 tax_alpha=0.0,
-                returns={1: 0.01, 2: -0.02, 3: 0.03},  # type: ignore[dict-item]
+                returns=benchmark_returns,
             )
         ]
-        benchmark_returns = {1: 0.01, 2: -0.02, 3: 0.03}  # type: ignore[var-annotated]
 
         model = prepare_tracking_model(candidates, benchmark_returns)
 
@@ -147,10 +166,12 @@ class OptimizerTests(unittest.TestCase):
             weight_iterations=200,
         )
 
-        self.assertEqual(len(portfolio["positions"]), 2)
-        sectors = {position["sector"] for position in portfolio["positions"]}
+        positions = object_list(portfolio["positions"])
+        metrics = object_map(portfolio["metrics"])
+        self.assertEqual(len(positions), 2)
+        sectors = {position["sector"] for position in positions}
         self.assertEqual(sectors, {"Tech", "Health"})
-        self.assertLessEqual(portfolio["metrics"]["sector_abs_error"], 0.15)
+        self.assertLessEqual(number(metrics["sector_abs_error"]), 0.15)
 
     def test_portfolio_harvest_simulation_realizes_losses_into_same_sector_replacements(self):
         dates = [date(2020, 1, 31), date(2020, 2, 29), date(2020, 3, 31)]
@@ -190,12 +211,12 @@ class OptimizerTests(unittest.TestCase):
 
         self.assertEqual(simulation["status"], "ok")
         self.assertEqual(simulation["harvest_count"], 1)
-        self.assertAlmostEqual(simulation["total_realized_loss"], 0.2, places=9)
-        self.assertGreater(simulation["portfolio_simulated_tax_alpha"], 0.0)
-        event = simulation["sample_events"][0]
+        self.assertAlmostEqual(number(simulation["total_realized_loss"]), 0.2, places=9)
+        self.assertGreater(number(simulation["portfolio_simulated_tax_alpha"]), 0.0)
+        event = object_list(simulation["sample_events"])[0]
         self.assertEqual(event["sold"], "NVDA")
         self.assertEqual(
-            {replacement["ticker"] for replacement in event["replacements"]},
+            {replacement["ticker"] for replacement in object_list(event["replacements"])},
             {"AMD", "INTC"},
         )
 
@@ -261,7 +282,7 @@ class OptimizerTests(unittest.TestCase):
         self.assertEqual(daily["harvest_frequency"], "daily")
         self.assertEqual(daily["harvest_count"], 1)
         self.assertEqual(daily["rebalance_count"], 1)
-        self.assertEqual(daily["sample_events"][0]["date"], "2020-01-02")
+        self.assertEqual(object_list(daily["sample_events"])[0]["date"], "2020-01-02")
         self.assertEqual(quarterly["harvest_count"], 0)
 
     def test_portfolio_harvest_path_metrics_track_realized_path(self):
@@ -311,13 +332,13 @@ class OptimizerTests(unittest.TestCase):
         self.assertEqual(simulation["status"], "ok")
         self.assertEqual(simulation["harvest_count"], 0)
         self.assertEqual(simulation["portfolio_harvest_observations"], 3)
-        self.assertAlmostEqual(simulation["portfolio_harvest_tracking_error"], 0.0, places=12)
-        self.assertAlmostEqual(simulation["portfolio_harvest_beta"], 1.0, places=12)
-        self.assertAlmostEqual(simulation["portfolio_harvest_correlation"], 1.0, places=12)
-        self.assertAlmostEqual(simulation["portfolio_harvest_active_return"], 0.0, places=12)
+        self.assertAlmostEqual(number(simulation["portfolio_harvest_tracking_error"]), 0.0, places=12)
+        self.assertAlmostEqual(number(simulation["portfolio_harvest_beta"]), 1.0, places=12)
+        self.assertAlmostEqual(number(simulation["portfolio_harvest_correlation"]), 1.0, places=12)
+        self.assertAlmostEqual(number(simulation["portfolio_harvest_active_return"]), 0.0, places=12)
         self.assertAlmostEqual(
-            simulation["portfolio_harvest_annualized_return"],
-            simulation["benchmark_annualized_return"],
+            number(simulation["portfolio_harvest_annualized_return"]),
+            number(simulation["benchmark_annualized_return"]),
             places=12,
         )
 
@@ -365,7 +386,7 @@ class OptimizerTests(unittest.TestCase):
 
         self.assertEqual(replacements["SRC"][0]["ticker"], "SAME")
         self.assertTrue(replacements["SRC"][0]["industry_match"])
-        self.assertGreater(replacements["SRC"][0]["return_correlation"], 0.9)
+        self.assertGreater(number(replacements["SRC"][0]["return_correlation"]), 0.9)
 
     def test_portfolio_harvest_simulation_uses_point_in_time_active_replacements(self):
         dates = [date(2020, 1, 31), date(2020, 2, 29), date(2020, 3, 31)]
@@ -414,7 +435,8 @@ class OptimizerTests(unittest.TestCase):
             historical_holdings=historical_holdings,
         )
 
-        replacements = simulation["sample_events"][0]["replacements"]
+        event = object_list(simulation["sample_events"])[0]
+        replacements = object_list(event["replacements"])
         self.assertEqual([replacement["ticker"] for replacement in replacements], ["AMD"])
         self.assertTrue(simulation["point_in_time_constituents"])
 

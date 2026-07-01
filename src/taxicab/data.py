@@ -12,7 +12,7 @@ import zipfile
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, cast
 import xml.etree.ElementTree as ET
 
 
@@ -528,7 +528,7 @@ def enrich_sectors(
 
 
 def write_prices_csv(
-    prices_by_ticker: Dict[str, Sequence[PricePoint]],
+    prices_by_ticker: Mapping[str, Sequence[PricePoint]],
     path: os.PathLike[str] | str,
 ) -> None:
     with open(path, "w", newline="", encoding="utf-8") as handle:
@@ -606,7 +606,7 @@ def cache_paths(data_dir: os.PathLike[str] | str) -> Dict[str, Path]:
 def write_cache(
     data_dir: os.PathLike[str] | str,
     holdings: Sequence[Holding],
-    prices_by_ticker: Dict[str, Sequence[PricePoint]],
+    prices_by_ticker: Mapping[str, Sequence[PricePoint]],
     metadata: Dict[str, object],
     historical_holdings: Optional[Mapping[date, Sequence[Holding]]] = None,
 ) -> None:
@@ -628,7 +628,7 @@ def read_cache(
     metadata = read_json(paths["metadata"])
     if not isinstance(metadata, dict):
         raise ValueError("metadata.json must contain an object")
-    return holdings, prices, metadata
+    return holdings, prices, cast(Dict[str, object], metadata)
 
 
 def read_historical_holdings_cache(data_dir: os.PathLike[str] | str) -> Dict[date, List[Holding]]:

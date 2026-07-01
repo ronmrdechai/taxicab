@@ -158,6 +158,16 @@ Construction uses `tqdm` progress bars for the selection and weight optimization
 
 Important caveat: simulated tax alpha is still a model, not a tax opinion or a guaranteed realized after-tax return. Real outcomes depend on your tax rate, holding periods, wash-sale management, replacement securities, transaction costs, contribution timing, and actual tax lots.
 
+## Checks
+
+Run linting, type checking, and the unit test suite before committing changes:
+
+```bash
+./scripts/check
+```
+
+The script runs `ruff check .`, `ty check .`, and the unit tests through `uv`.
+
 ## Tests
 
 ```bash

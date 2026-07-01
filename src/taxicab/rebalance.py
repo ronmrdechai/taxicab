@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import math
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, cast
 
 
 @dataclass(frozen=True)
@@ -131,7 +131,7 @@ def _operation(
     )
 
 
-def _target_weights(state: Dict[str, object]) -> Dict[str, float]:
+def _target_weights(state: Mapping[str, object]) -> Dict[str, float]:
     positions = state.get("positions")
     if not isinstance(positions, list):
         raise ValueError("state file is missing positions")
@@ -139,13 +139,14 @@ def _target_weights(state: Dict[str, object]) -> Dict[str, float]:
     for item in positions:
         if not isinstance(item, dict):
             continue
-        ticker = str(item.get("ticker", "")).upper()
+        position = cast(Mapping[str, object], item)
+        ticker = str(position.get("ticker", "")).upper()
         if ticker:
-            weights[ticker] = float(item.get("weight", 0.0))
+            weights[ticker] = _float_value(position.get("weight", 0.0))
     return weights
 
 
-def _target_prices(state: Dict[str, object]) -> Dict[str, float]:
+def _target_prices(state: Mapping[str, object]) -> Dict[str, float]:
     positions = state.get("positions")
     if not isinstance(positions, list):
         return {}
@@ -153,15 +154,16 @@ def _target_prices(state: Dict[str, object]) -> Dict[str, float]:
     for item in positions:
         if not isinstance(item, dict):
             continue
-        ticker = str(item.get("ticker", "")).upper()
-        price = _float_or_none(item.get("last_price"))
+        position = cast(Mapping[str, object], item)
+        ticker = str(position.get("ticker", "")).upper()
+        price = _float_or_none(position.get("last_price"))
         if ticker and price and price > 0:
             prices[ticker] = price
     return prices
 
 
 def _replacement_for(
-    state: Dict[str, object],
+    state: Mapping[str, object],
     ticker: str,
     unavailable: Iterable[str],
 ) -> Optional[str]:
@@ -169,20 +171,28 @@ def _replacement_for(
     replacements = state.get("replacement_candidates", {})
     if not isinstance(replacements, dict):
         return None
-    candidates = replacements.get(ticker.upper()) or []
+    replacement_map = cast(Mapping[str, object], replacements)
+    candidates = replacement_map.get(ticker.upper()) or []
     if not isinstance(candidates, list):
         return None
     for item in candidates:
         if not isinstance(item, dict):
             continue
-        replacement = str(item.get("ticker", "")).upper()
+        candidate = cast(Mapping[str, object], item)
+        replacement = str(candidate.get("ticker", "")).upper()
         if replacement and replacement not in unavailable_set:
             return replacement
     return None
 
 
+def _float_value(value: object) -> float:
+    if isinstance(value, (int, float, str)):
+        return float(value)
+    raise TypeError(f"expected a numeric value, got {type(value).__name__}")
+
+
 def plan_rebalance(
-    state: Dict[str, object],
+    state: Mapping[str, object],
     current_positions: Sequence[CurrentPosition],
     portfolio_value: Optional[float] = None,
     drift_threshold_pct: float = 0.005,

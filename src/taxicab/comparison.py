@@ -4,7 +4,7 @@ import math
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Sequence, Tuple, cast
 
 from .data import Holding, PricePoint, sector_targets
 from .metrics import cumulative_return, daily_returns
@@ -179,10 +179,11 @@ def position_weights(portfolio: Mapping[str, object]) -> Dict[str, float]:
     for item in positions:
         if not isinstance(item, dict):
             continue
-        ticker = str(item.get("ticker", "")).upper()
+        position = cast(Mapping[str, object], item)
+        ticker = str(position.get("ticker", "")).upper()
         if not ticker:
             continue
-        weight = float(item.get("weight", 0.0))
+        weight = _float_value(position.get("weight", 0.0))
         weights[ticker] = weights.get(ticker, 0.0) + weight
     return weights
 
@@ -195,8 +196,9 @@ def portfolio_sector_weights(portfolio: Mapping[str, object]) -> Dict[str, float
     for item in positions:
         if not isinstance(item, dict):
             continue
-        sector = str(item.get("sector") or "Unknown")
-        weight = float(item.get("weight", 0.0))
+        position = cast(Mapping[str, object], item)
+        sector = str(position.get("sector") or "Unknown")
+        weight = _float_value(position.get("weight", 0.0))
         sectors[sector] = sectors.get(sector, 0.0) + weight
     return sectors
 
@@ -228,7 +230,8 @@ def pair_return_summary(
     left_values: Sequence[float],
     right_values: Sequence[float],
 ) -> Dict[str, object]:
-    left_summary = standalone_return_summary(dates, left_values)
+    left_cumulative_return = cumulative_return(left_values)
+    right_cumulative_return = cumulative_return(right_values)
     active = [left - right for left, right in zip(left_values, right_values)]
     return {
         "observations": len(left_values),
@@ -238,9 +241,9 @@ def pair_return_summary(
         "left_beta_to_right": beta(left_values, right_values),
         "tracking_error": annualized_std(active),
         "annualized_active_return": mean(active) * ANNUALIZATION if active else 0.0,
-        "left_cumulative_return": left_summary["cumulative_return"],
-        "right_cumulative_return": cumulative_return(right_values),
-        "cumulative_return_difference": left_summary["cumulative_return"] - cumulative_return(right_values),
+        "left_cumulative_return": left_cumulative_return,
+        "right_cumulative_return": right_cumulative_return,
+        "cumulative_return_difference": left_cumulative_return - right_cumulative_return,
     }
 
 
@@ -353,6 +356,12 @@ def sample_variance(values: Sequence[float]) -> float:
 
 def mean(values: Sequence[float]) -> float:
     return sum(values) / len(values) if values else 0.0
+
+
+def _float_value(value: object) -> float:
+    if isinstance(value, (int, float, str)):
+        return float(value)
+    raise TypeError(f"expected a numeric value, got {type(value).__name__}")
 
 
 def parse_labeled_path(value: str) -> Tuple[str, Path]:
