@@ -8,6 +8,7 @@ import numpy as np
 from taxicab.data import Holding, PricePoint
 from taxicab.optimizer import (
     Candidate,
+    benchmark_proxy_returns,
     construct_portfolio,
     optimize_weights,
     prepare_tracking_model,
@@ -84,6 +85,26 @@ class OptimizerTests(unittest.TestCase):
         assert model is not None
         self.assertIsInstance(model.covariance_matrix, np.ndarray)
         self.assertAlmostEqual(tracking_error([1.0], model), 0.0, places=9)
+
+    def test_benchmark_proxy_returns_use_index_weights(self):
+        left_returns = returns([0.01, -0.02, 0.03])
+        right_returns = returns([0.03, -0.01, 0.01])
+        candidates = [
+            Candidate("LEFT", 0.75, "Tech", beta=1.0, tax_alpha=0.0, returns=left_returns),
+            Candidate("RIGHT", 0.25, "Health", beta=1.0, tax_alpha=0.0, returns=right_returns),
+        ]
+
+        proxy_returns = benchmark_proxy_returns(candidates)
+        model = prepare_tracking_model(candidates, proxy_returns)
+
+        assert model is not None
+        for day in left_returns:
+            self.assertAlmostEqual(
+                proxy_returns[day],
+                0.75 * left_returns[day] + 0.25 * right_returns[day],
+                places=12,
+            )
+        self.assertLess(tracking_error([0.75, 0.25], model), 1e-8)
 
     def test_optimize_weights_moves_toward_error_margin_and_tax_targets(self):
         benchmark_returns = returns([0.01, -0.01, 0.02, -0.02, 0.015, -0.015] * 8)

@@ -54,7 +54,7 @@ class ReplayConstraintConfig:
     beta_target: float = 1.0
     beta_band: float = 0.02
     active_share_warning: float = 0.35
-    active_share_limit: float = 0.50
+    active_share_limit: float = 0.35
     cash_weight_limit: float = 0.0001
     enforce_min_names: int = 50
     max_weight_limit: Optional[float] = None
@@ -175,6 +175,37 @@ class _ReturnCorrelationCache:
         value = max(min(float(left_centered @ right_centered) / denominator, 1.0), -1.0)
         self.cache[key] = value
         return value
+
+
+def benchmark_proxy_returns(candidates: Sequence[Candidate]) -> Dict[date, float]:
+    weighted_candidates = [
+        (candidate, max(0.0, candidate.index_weight))
+        for candidate in candidates
+        if candidate.returns and candidate.index_weight > 0
+    ]
+    total_weight = sum(weight for _, weight in weighted_candidates)
+    if total_weight <= 0:
+        return {}
+
+    common_dates: Optional[Set[date]] = None
+    for candidate, _ in weighted_candidates:
+        assert candidate.returns is not None
+        candidate_dates = set(candidate.returns)
+        if common_dates is None:
+            common_dates = candidate_dates
+        else:
+            common_dates.intersection_update(candidate_dates)
+    if common_dates is None or len(common_dates) < 2:
+        return {}
+
+    proxy: Dict[date, float] = {}
+    for day in sorted(common_dates):
+        proxy[day] = sum(
+            weight / total_weight * candidate.returns[day]
+            for candidate, weight in weighted_candidates
+            if candidate.returns is not None
+        )
+    return proxy
 
 
 @dataclass(frozen=True)
@@ -1576,6 +1607,10 @@ def _replay_constraints_allow(
     if selected_count < constraints.enforce_min_names:
         return True, []
     after_violations = _replay_violations(after, constraints)
+    before_tracking_error = _snapshot_number(before, "tracking_error")
+    after_tracking_error = _snapshot_number(after, "tracking_error")
+    if after_tracking_error > before_tracking_error + 1e-6:
+        after_violations.append("tracking_error_increase")
     if not after_violations:
         return True, []
     return False, after_violations
@@ -2081,13 +2116,14 @@ def simulate_portfolio_harvests(
 
     tickers = {candidate.ticker for candidate in universe}.union(candidate.ticker for candidate in selected)
     table = _price_table(tickers, prices, schedule)
-    tracking_cache = _TrackingArrayCache(universe, benchmark_returns)
+    tracking_benchmark_returns = benchmark_proxy_returns(universe) or benchmark_returns
+    tracking_cache = _TrackingArrayCache(universe, tracking_benchmark_returns)
     benchmark_weights = _benchmark_weight_map(universe)
     target_sectors = _sector_targets_from_candidates(universe)
     construction_tracking_limit = min(error_margin, 0.02)
     constraints = ReplayConstraintConfig(
         tracking_error_limit=construction_tracking_limit,
-        path_tracking_error_limit=min(max(construction_tracking_limit * 1.25, 0.015), 0.025),
+        path_tracking_error_limit=construction_tracking_limit,
         max_weight_limit=max_weight_limit
         if max_weight_limit is not None
         else (_default_scalar_max_weight(len(selected)) if len(selected) >= 50 else None),
@@ -2097,7 +2133,7 @@ def simulate_portfolio_harvests(
             candidate,
             construction_tracking_limit,
             target_tax_alpha,
-            benchmark_returns,
+            tracking_benchmark_returns,
             tax_alpha_mode,
             tracking_cache=tracking_cache,
         )
@@ -2504,14 +2540,20 @@ def simulate_portfolio_harvests(
         portfolio_simulated_tax_alpha = 0.0
         immediate_tax_savings_rate = 0.0
         immediate_net_tax_savings_rate = 0.0
-    benchmark_lookup = _price_lookup_for_dates(benchmark_points, simulation_dates)
     aligned_portfolio_values = []
     aligned_benchmark_values = []
-    for day, portfolio_value in zip(simulation_dates, portfolio_values):
-        benchmark_value = benchmark_lookup.get(day)
-        if benchmark_value is not None and benchmark_value > 0 and portfolio_value > 0:
-            aligned_portfolio_values.append(portfolio_value)
-            aligned_benchmark_values.append(benchmark_value)
+    if portfolio_values and portfolio_values[0] > 0:
+        aligned_portfolio_values.append(portfolio_values[0])
+        aligned_benchmark_values.append(portfolio_values[0])
+        benchmark_value = portfolio_values[0]
+        for day, portfolio_value in zip(simulation_dates[1:], portfolio_values[1:]):
+            benchmark_return = tracking_benchmark_returns.get(day)
+            if benchmark_return is None or portfolio_value <= 0:
+                continue
+            benchmark_value *= 1.0 + benchmark_return
+            if benchmark_value > 0:
+                aligned_portfolio_values.append(portfolio_value)
+                aligned_benchmark_values.append(benchmark_value)
     path_metrics = _harvest_path_metrics(
         aligned_portfolio_values,
         aligned_benchmark_values,
@@ -2635,14 +2677,15 @@ def construct_portfolio(
         raise ValueError("benchmark_returns are required to optimize error margin")
     tax_frequency = harvest_frequency or rebalance_frequency
     construction_error_margin = min(error_margin, 0.02)
+    construction_benchmark_returns = benchmark_proxy_returns(candidates) or benchmark_returns
     targets = sector_targets(holdings) if match_sectors else None
-    tracking_cache = _TrackingArrayCache(candidates, benchmark_returns)
+    tracking_cache = _TrackingArrayCache(candidates, construction_benchmark_returns)
     initial = initial_selection(
         candidates,
         sample_size,
         construction_error_margin,
         target_tax_alpha,
-        benchmark_returns,
+        construction_benchmark_returns,
         match_sectors,
         targets,
         tax_alpha_mode=tax_alpha_mode,
@@ -2655,7 +2698,7 @@ def construct_portfolio(
         sample_size,
         construction_error_margin,
         target_tax_alpha,
-        benchmark_returns,
+        construction_benchmark_returns,
         targets,
         match_sectors,
         tax_alpha_mode=tax_alpha_mode,
@@ -2674,15 +2717,21 @@ def construct_portfolio(
         iterations=weight_iterations,
         min_weight=min_weight,
         max_weight=max_weight,
-        benchmark_returns=benchmark_returns,
+        benchmark_returns=construction_benchmark_returns,
         tracking_error_penalty=tracking_error_penalty,
         index_anchor_penalty=index_anchor_penalty,
         sector_band=0.02 if match_sectors else None,
         show_progress=show_progress,
         progress_label=f"{progress_label} weights",
     )
-    tracking_model = prepare_tracking_model(selected, benchmark_returns)
+    tracking_model = prepare_tracking_model(selected, construction_benchmark_returns)
     metrics = portfolio_metrics(selected, weights, tracking_model=tracking_model)
+    price_tracking_model = prepare_tracking_model(selected, benchmark_returns)
+    if price_tracking_model is not None:
+        metrics["price_benchmark_tracking_error"] = tracking_error(weights, price_tracking_model)
+        metrics["price_benchmark_tracking_error_annualized_pct"] = (
+            float(metrics["price_benchmark_tracking_error"]) * 100.0
+        )
     metrics["active_share"] = active_share(selected, weights, holdings)
     sector_targets_out = targets or {}
     if sector_targets_out:
@@ -2722,6 +2771,7 @@ def construct_portfolio(
             "sample_size": sample_size,
             "error_margin": error_margin,
             "construction_tracking_error_limit": construction_error_margin,
+            "tracking_model": "current_constituent_proxy",
             "estimated_tax_loss_alpha": target_tax_alpha,
             "tax_alpha_mode": tax_alpha_mode,
             "min_weight": min_weight,
@@ -2742,7 +2792,7 @@ def construct_portfolio(
             selected,
             error_margin,
             target_tax_alpha,
-            benchmark_returns,
+            benchmark_proxy_returns(replacement_universe or candidates) or construction_benchmark_returns,
             tax_alpha_mode=tax_alpha_mode,
         ),
     }
