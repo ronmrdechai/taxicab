@@ -173,6 +173,86 @@ class OptimizerTests(unittest.TestCase):
         self.assertEqual(sectors, {"Tech", "Health"})
         self.assertLessEqual(number(metrics["sector_abs_error"]), 0.15)
 
+    def test_construct_250_stock_portfolio_satisfies_direct_indexing_sanity_constraints(self):
+        benchmark_returns = returns([0.01, -0.008, 0.006, -0.004, 0.003] * 12)
+        sectors = ["Tech", "Health", "Financials", "Industrials", "Staples"]
+        holdings = [
+            Holding(f"TICK{idx:03d}", 1.0 / 250.0, sectors[idx % len(sectors)])
+            for idx in range(250)
+        ]
+        candidates = [
+            Candidate(
+                holding.ticker,
+                holding.weight,
+                holding.sector,
+                beta=1.0,
+                tax_alpha=0.02,
+                simulated_tax_alpha=0.02,
+                gross_harvestable_loss_rate=0.04,
+                observations=300,
+                returns=benchmark_returns,
+            )
+            for holding in holdings
+        ]
+
+        portfolio = construct_portfolio(
+            candidates,
+            holdings,
+            sample_size=250,
+            error_margin=0.05,
+            target_tax_alpha=0.02,
+            rebalance_frequency="quarterly",
+            match_sectors=True,
+            benchmark_returns=benchmark_returns,
+            selection_iterations=0,
+            weight_iterations=20,
+        )
+
+        positions = object_list(portfolio["positions"])
+        metrics = object_map(portfolio["metrics"])
+        weights = [number(position["weight"]) for position in positions]
+        self.assertAlmostEqual(sum(weights), 1.0, places=9)
+        self.assertLessEqual(max(weights), 0.0080001)
+        self.assertGreater(number(metrics["effective_number_of_names"]), 100.0)
+        self.assertLessEqual(number(metrics["sector_abs_error"]), 0.02)
+        self.assertLessEqual(number(metrics["tracking_error"]), 0.02)
+        self.assertLessEqual(number(metrics["active_share"]), 0.35)
+        self.assertIn("tracking_error_annualized_pct", metrics)
+        self.assertIn("max_weight_pct", metrics)
+
+    def test_construct_250_stock_portfolio_rejects_hard_fidelity_violations(self):
+        benchmark_returns = returns([0.01, -0.008, 0.006, -0.004, 0.003] * 12)
+        holdings = [
+            Holding(f"ACTIVE{idx:03d}", 1.0 / 250.0, "Tech")
+            for idx in range(250)
+        ]
+        candidates = [
+            Candidate(
+                holding.ticker,
+                holding.weight,
+                holding.sector,
+                beta=1.6,
+                tax_alpha=0.05,
+                observations=300,
+                returns={day: value * 1.6 for day, value in benchmark_returns.items()},
+            )
+            for holding in holdings
+        ]
+
+        with self.assertRaisesRegex(ValueError, "hard benchmark-fidelity constraints"):
+            construct_portfolio(
+                candidates,
+                holdings,
+                sample_size=250,
+                error_margin=0.05,
+                target_tax_alpha=0.03,
+                rebalance_frequency="quarterly",
+                match_sectors=True,
+                benchmark_returns=benchmark_returns,
+                selection_iterations=0,
+                weight_iterations=20,
+            )
+
     def test_portfolio_harvest_simulation_realizes_losses_into_same_sector_replacements(self):
         dates = [date(2020, 1, 31), date(2020, 2, 29), date(2020, 3, 31)]
         benchmark_returns = returns([0.0, 0.0, 0.0])
@@ -212,13 +292,21 @@ class OptimizerTests(unittest.TestCase):
         self.assertEqual(simulation["status"], "ok")
         self.assertEqual(simulation["harvest_count"], 1)
         self.assertAlmostEqual(number(simulation["total_realized_loss"]), 0.2, places=9)
-        self.assertGreater(number(simulation["portfolio_simulated_tax_alpha"]), 0.0)
+        self.assertGreater(number(simulation["immediate_tax_savings_pct_per_year"]), 0.0)
+        self.assertLess(
+            number(simulation["full_liquidation_after_tax_alpha_pct_per_year"]),
+            number(simulation["immediate_tax_savings_pct_per_year"]),
+        )
         event = object_list(simulation["sample_events"])[0]
         self.assertEqual(event["sold"], "NVDA")
         self.assertEqual(
             {replacement["ticker"] for replacement in object_list(event["replacements"])},
             {"AMD", "INTC"},
         )
+        after = object_map(event["diagnostics_after"])
+        self.assertLessEqual(number(after["cash_weight"]), 0.0001)
+        diagnostics = object_list(simulation["harvest_diagnostics"])[0]
+        self.assertEqual(diagnostics["replacement_names"], ["AMD", "INTC"])
 
     def test_portfolio_harvest_simulation_can_harvest_daily_between_quarterly_rebalances(self):
         dates = [
@@ -284,6 +372,153 @@ class OptimizerTests(unittest.TestCase):
         self.assertEqual(daily["rebalance_count"], 1)
         self.assertEqual(object_list(daily["sample_events"])[0]["date"], "2020-01-02")
         self.assertEqual(quarterly["harvest_count"], 0)
+
+    def test_portfolio_harvest_replay_keeps_benchmark_like_path_after_replacement(self):
+        dates = [
+            date(2020, 1, 31),
+            date(2020, 2, 29),
+            date(2020, 3, 31),
+            date(2020, 4, 30),
+        ]
+        benchmark_prices = [100.0, 80.0, 90.0, 100.0]
+        benchmark_returns = {
+            dates[1]: benchmark_prices[1] / benchmark_prices[0] - 1.0,
+            dates[2]: benchmark_prices[2] / benchmark_prices[1] - 1.0,
+            dates[3]: benchmark_prices[3] / benchmark_prices[2] - 1.0,
+        }
+        candidates = [
+            Candidate("LOSS", 0.50, "Tech", beta=1.0, tax_alpha=0.05, observations=300, returns=benchmark_returns),
+            Candidate("ALT", 0.50, "Tech", beta=1.0, tax_alpha=0.05, observations=300, returns=benchmark_returns),
+        ]
+        prices = {
+            "SPY": [PricePoint(day, price) for day, price in zip(dates, benchmark_prices)],
+            "LOSS": [PricePoint(day, price) for day, price in zip(dates, benchmark_prices)],
+            "ALT": [PricePoint(day, price) for day, price in zip(dates, benchmark_prices)],
+        }
+
+        simulation = simulate_portfolio_harvests(
+            [candidates[0]],
+            [1.0],
+            candidates,
+            prices,
+            "SPY",
+            benchmark_returns,
+            "monthly",
+            error_margin=0.05,
+            target_tax_alpha=0.03,
+            tax_rate=0.30,
+            harvest_threshold_pct=0.05,
+            transaction_cost_bps=0.0,
+            replacement_cost_bps=0.0,
+            replacement_count=1,
+        )
+
+        self.assertEqual(simulation["harvest_count"], 1)
+        self.assertAlmostEqual(number(simulation["portfolio_harvest_beta"]), 1.0, places=12)
+        self.assertAlmostEqual(number(simulation["portfolio_harvest_tracking_error"]), 0.0, places=12)
+        self.assertLessEqual(number(simulation["cash_drag"]), 0.0001)
+
+    def test_wash_sale_blocked_security_is_not_rebought_within_window(self):
+        dates = [
+            date(2020, 1, 1),
+            date(2020, 1, 2),
+            date(2020, 1, 3),
+            date(2020, 2, 10),
+        ]
+        benchmark_returns = returns([0.0, 0.0, 0.0, 0.0])
+        candidates = [
+            Candidate("LOSS1", 0.34, "Tech", beta=1.0, tax_alpha=0.05, observations=300, returns=benchmark_returns),
+            Candidate("LOSS2", 0.33, "Tech", beta=1.0, tax_alpha=0.05, observations=300, returns=benchmark_returns),
+            Candidate("ALT", 0.20, "Tech", beta=1.0, tax_alpha=0.05, observations=300, returns=benchmark_returns),
+            Candidate("SAFE", 0.13, "Tech", beta=1.0, tax_alpha=0.05, observations=300, returns=benchmark_returns),
+        ]
+        prices = {
+            "SPY": [PricePoint(day, 100.0) for day in dates],
+            "LOSS1": [
+                PricePoint(dates[0], 100.0),
+                PricePoint(dates[1], 80.0),
+                PricePoint(dates[2], 80.0),
+                PricePoint(dates[3], 100.0),
+            ],
+            "LOSS2": [
+                PricePoint(dates[0], 100.0),
+                PricePoint(dates[1], 100.0),
+                PricePoint(dates[2], 80.0),
+                PricePoint(dates[3], 100.0),
+            ],
+            "ALT": [PricePoint(day, 100.0) for day in dates],
+            "SAFE": [PricePoint(day, 100.0) for day in dates],
+        }
+
+        simulation = simulate_portfolio_harvests(
+            candidates[:2],
+            [0.5, 0.5],
+            candidates,
+            prices,
+            "SPY",
+            benchmark_returns,
+            "quarterly",
+            error_margin=0.05,
+            target_tax_alpha=0.03,
+            tax_rate=0.30,
+            harvest_threshold_pct=0.05,
+            transaction_cost_bps=0.0,
+            replacement_cost_bps=0.0,
+            replacement_count=1,
+            wash_sale_days=31,
+            harvest_frequency="daily",
+        )
+
+        events = object_list(simulation["sample_events"])
+        self.assertEqual([event["sold"] for event in events[:2]], ["LOSS1", "LOSS2"])
+        second_replacements = object_list(events[1]["replacements"])
+        self.assertNotEqual(second_replacements[0]["ticker"], "LOSS1")
+
+    def test_portfolio_harvest_rebalances_available_targets_when_one_target_is_banned(self):
+        dates = [
+            date(2020, 1, 1),
+            date(2020, 3, 30),
+            date(2020, 3, 31),
+            date(2020, 4, 1),
+        ]
+        benchmark_returns = returns([0.0, 0.0, 0.0, 0.0])
+        candidates = [
+            Candidate("LOSS", 0.50, "Tech", beta=1.0, tax_alpha=0.05, observations=300, returns=benchmark_returns),
+            Candidate("KEEP", 0.50, "Tech", beta=1.0, tax_alpha=0.05, observations=300, returns=benchmark_returns),
+            Candidate("ALT", 0.10, "Tech", beta=1.0, tax_alpha=0.05, observations=300, returns=benchmark_returns),
+        ]
+        prices = {
+            "SPY": [PricePoint(day, 100.0) for day in dates],
+            "LOSS": [
+                PricePoint(dates[0], 100.0),
+                PricePoint(dates[1], 80.0),
+                PricePoint(dates[2], 80.0),
+                PricePoint(dates[3], 80.0),
+            ],
+            "KEEP": [PricePoint(day, 100.0) for day in dates],
+            "ALT": [PricePoint(day, 100.0) for day in dates],
+        }
+
+        simulation = simulate_portfolio_harvests(
+            candidates[:2],
+            [0.5, 0.5],
+            candidates,
+            prices,
+            "SPY",
+            benchmark_returns,
+            "quarterly",
+            error_margin=0.05,
+            target_tax_alpha=0.03,
+            tax_rate=0.30,
+            harvest_threshold_pct=0.05,
+            transaction_cost_bps=0.0,
+            replacement_cost_bps=0.0,
+            replacement_count=1,
+            harvest_frequency="daily",
+        )
+
+        self.assertEqual(simulation["harvest_count"], 1)
+        self.assertEqual(simulation["rebalance_count"], 1)
 
     def test_portfolio_harvest_path_metrics_track_realized_path(self):
         dates = [
@@ -392,9 +627,36 @@ class OptimizerTests(unittest.TestCase):
         dates = [date(2020, 1, 31), date(2020, 2, 29), date(2020, 3, 31)]
         benchmark_returns = returns([0.0, 0.0, 0.0])
         candidates = [
-            Candidate("NVDA", 0.40, "Tech", beta=1.0, tax_alpha=0.05, observations=300, returns=benchmark_returns, industry="Semiconductors"),
-            Candidate("AMD", 0.35, "Tech", beta=1.0, tax_alpha=0.05, observations=300, returns=benchmark_returns, industry="Semiconductors"),
-            Candidate("INTC", 0.25, "Tech", beta=1.0, tax_alpha=0.05, observations=300, returns=benchmark_returns, industry="Semiconductors"),
+            Candidate(
+                "NVDA",
+                0.40,
+                "Tech",
+                beta=1.0,
+                tax_alpha=0.05,
+                observations=300,
+                returns=benchmark_returns,
+                industry="Semiconductors",
+            ),
+            Candidate(
+                "AMD",
+                0.35,
+                "Tech",
+                beta=1.0,
+                tax_alpha=0.05,
+                observations=300,
+                returns=benchmark_returns,
+                industry="Semiconductors",
+            ),
+            Candidate(
+                "INTC",
+                0.25,
+                "Tech",
+                beta=1.0,
+                tax_alpha=0.05,
+                observations=300,
+                returns=benchmark_returns,
+                industry="Semiconductors",
+            ),
         ]
         prices = {
             "SPY": [PricePoint(day, 100.0) for day in dates],

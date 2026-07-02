@@ -172,6 +172,36 @@ def simulated_tax_alpha(
     return total_net_benefit / average_capital / years
 
 
+def simulated_realized_loss_rate(
+    points: Sequence[PricePoint],
+    frequency: str,
+    harvest_threshold_pct: float = 0.05,
+) -> float:
+    endpoints = period_end_points(points, frequency)
+    if len(endpoints) < 2:
+        return 0.0
+    if harvest_threshold_pct < 0:
+        raise ValueError("harvest_threshold_pct must be nonnegative")
+
+    basis = endpoints[0].adj_close
+    total_realized_loss = 0.0
+    for point in endpoints[1:]:
+        value = point.adj_close
+        if basis <= 0 or value <= 0:
+            continue
+        unrealized_return = value / basis - 1.0
+        if unrealized_return > -harvest_threshold_pct:
+            continue
+        total_realized_loss += basis - value
+        basis = value
+
+    years = max((endpoints[-1].day - endpoints[0].day).days / 365.25, 1.0 / FREQUENCIES[frequency])
+    average_capital = sum(point.adj_close for point in endpoints) / len(endpoints)
+    if average_capital <= 0:
+        return 0.0
+    return total_realized_loss / average_capital / years
+
+
 def observations_overlap(
     asset_returns: Dict[date, float],
     benchmark_returns: Dict[date, float],

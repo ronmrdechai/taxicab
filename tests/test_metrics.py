@@ -2,7 +2,13 @@ from datetime import date, timedelta
 import unittest
 
 from taxicab.data import PricePoint
-from taxicab.metrics import beta_to_benchmark, daily_returns, estimated_tax_loss_alpha, simulated_tax_alpha
+from taxicab.metrics import (
+    beta_to_benchmark,
+    daily_returns,
+    estimated_tax_loss_alpha,
+    simulated_realized_loss_rate,
+    simulated_tax_alpha,
+)
 
 
 def series_from_returns(start_price, returns):
@@ -63,6 +69,20 @@ class MetricsTests(unittest.TestCase):
         alpha = estimated_tax_loss_alpha(points, "daily")
 
         self.assertAlmostEqual(alpha, 12.6, places=6)
+
+    def test_simulated_realized_loss_rate_resets_basis_and_avoids_recounting_same_loss(self):
+        points = [
+            PricePoint(date(2020, 1, 1), 100.0),
+            PricePoint(date(2020, 1, 2), 90.0),
+            PricePoint(date(2020, 1, 3), 89.0),
+            PricePoint(date(2020, 1, 4), 99.0),
+        ]
+
+        loss_rate = simulated_realized_loss_rate(points, "daily", harvest_threshold_pct=0.05)
+
+        years = 3.0 / 365.25
+        average_capital = (100.0 + 90.0 + 89.0 + 99.0) / 4.0
+        self.assertAlmostEqual(loss_rate, 10.0 / average_capital / years, places=6)
 
     def test_simulated_tax_alpha_applies_tax_rate_and_resets_basis(self):
         points = [

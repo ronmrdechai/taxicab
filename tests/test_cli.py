@@ -72,8 +72,9 @@ class CliTests(unittest.TestCase):
             self.assertEqual(state["targets"]["harvest_frequency"], "daily")
             self.assertEqual(state["portfolio_harvest_simulation"]["harvest_frequency"], "daily")
             self.assertIn("beta=", stdout.getvalue())
-            self.assertIn("error percentage=", stdout.getvalue())
+            self.assertIn("tracking_error_annualized_pct=", stdout.getvalue())
             self.assertIn("error_percentage", state["metrics"])
+            self.assertIn("tracking_error_annualized_pct", state["metrics"])
 
     def test_compare_command_writes_similarity_report(self):
         with tempfile.TemporaryDirectory() as tmp:

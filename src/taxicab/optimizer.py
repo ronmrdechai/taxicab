@@ -4,7 +4,7 @@ import math
 import random
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 import numpy as np
 from scipy.optimize import minimize
@@ -15,9 +15,9 @@ from .metrics import (
     FREQUENCIES,
     beta_to_benchmark,
     daily_returns,
-    estimated_tax_loss_alpha,
     observations_overlap,
     period_end_points,
+    simulated_realized_loss_rate,
     simulated_tax_alpha,
 )
 
@@ -43,6 +43,21 @@ class TrackingModel:
     benchmark_variance: float
     observations: int
     annualization: float = 252.0
+
+
+@dataclass(frozen=True)
+class ReplayConstraintConfig:
+    tracking_error_limit: float
+    path_tracking_error_limit: float
+    sector_band: float = 0.02
+    sector_abs_error_limit: float = 0.05
+    beta_target: float = 1.0
+    beta_band: float = 0.02
+    active_share_warning: float = 0.35
+    active_share_limit: float = 0.50
+    cash_weight_limit: float = 0.0001
+    enforce_min_names: int = 50
+    max_weight_limit: Optional[float] = None
 
 
 class _TrackingArrayCache:
@@ -200,7 +215,11 @@ def build_candidates(
         overlap = observations_overlap(asset_returns, benchmark_returns)
         if overlap < min_observations:
             continue
-        gross = estimated_tax_loss_alpha(prices[holding.ticker], tax_frequency)
+        gross = simulated_realized_loss_rate(
+            prices[holding.ticker],
+            tax_frequency,
+            harvest_threshold_pct=harvest_threshold_pct,
+        )
         simulated = simulated_tax_alpha(
             prices[holding.ticker],
             tax_frequency,
@@ -304,6 +323,57 @@ def project_to_bounded_simplex(
     return _project_to_bounded_simplex_array(values, lower, upper).tolist()
 
 
+def _default_scalar_max_weight(count: int) -> float:
+    if count <= 0:
+        return 1.0
+    if count < 50:
+        return 1.0
+    # A 2.0% cap is realistic for a broad direct-indexing sample. For smaller
+    # samples, relax just enough that a fully invested portfolio is feasible.
+    return min(1.0, max(0.02, 1.05 / count))
+
+
+def _benchmark_aware_upper_bounds(
+    candidates: Sequence[Candidate],
+    min_weight: float,
+    max_weight: Optional[float],
+) -> np.ndarray:
+    if not candidates:
+        return np.asarray([], dtype=float)
+    default_cap = _default_scalar_max_weight(len(candidates))
+    if max_weight is None or len(candidates) < 50:
+        scalar_cap = float(max_weight) if max_weight is not None else default_cap
+    else:
+        scalar_cap = min(float(max_weight), default_cap)
+    if scalar_cap <= 0:
+        raise ValueError("max_weight must be positive")
+    if min_weight > scalar_cap:
+        raise ValueError("min_weight cannot exceed max_weight")
+    if len(candidates) * min_weight > 1.0 + 1e-12:
+        raise ValueError("min_weight is too large for the number of positions")
+    if len(candidates) * scalar_cap < 1.0 - 1e-12:
+        raise ValueError("max_weight is too small for the number of positions")
+
+    anchor_weights = index_normalized_weights(candidates)
+    caps = np.asarray(
+        [
+            max(min_weight, min(scalar_cap, 2.0 * max(anchor_weight, 0.0)))
+            for anchor_weight in anchor_weights
+        ],
+        dtype=float,
+    )
+    if float(np.sum(caps)) >= 1.0 - 1e-12:
+        return caps
+
+    # The 2x-benchmark rule can be infeasible after sampling because excluded
+    # names' weights must be redistributed. Relax toward the scalar cap before
+    # giving up on the cap entirely.
+    scalar_caps = np.full(len(candidates), scalar_cap, dtype=float)
+    if float(np.sum(scalar_caps)) >= 1.0 - 1e-12:
+        return scalar_caps
+    return np.full(len(candidates), 1.0, dtype=float)
+
+
 def _project_to_bounded_simplex_array(values: Sequence[float], lower: float, upper: float) -> np.ndarray:
     array = np.asarray(values, dtype=float)
     low = float(np.min(array) - upper)
@@ -328,11 +398,79 @@ def _project_to_bounded_simplex_array(values: Sequence[float], lower: float, upp
     return projected
 
 
+def _project_to_variable_bounded_simplex_array(
+    values: Sequence[float],
+    lower: float,
+    uppers: Sequence[float] | np.ndarray,
+) -> np.ndarray:
+    array = np.asarray(values, dtype=float)
+    upper_array = np.asarray(uppers, dtype=float)
+    if len(array) != len(upper_array):
+        raise ValueError("values and upper bounds must have the same length")
+    if len(array) == 0:
+        return array
+    if lower < 0:
+        raise ValueError("lower bound must be nonnegative")
+    if np.any(upper_array < lower):
+        raise ValueError("upper bounds must be greater than or equal to lower bound")
+    if len(array) * lower > 1.0 + 1e-12:
+        raise ValueError("lower bound is too large for the number of positions")
+    if float(np.sum(upper_array)) < 1.0 - 1e-12:
+        raise ValueError("upper bounds are too small for a fully invested portfolio")
+
+    low = float(np.min(array - upper_array))
+    high = float(np.max(array - lower))
+    for _ in range(100):
+        theta = (low + high) / 2.0
+        projected = np.minimum(np.maximum(array - theta, lower), upper_array)
+        if float(np.sum(projected)) > 1.0:
+            low = theta
+        else:
+            high = theta
+    projected = np.minimum(np.maximum(array - high, lower), upper_array)
+    total = float(np.sum(projected))
+    adjustment = 1.0 - total
+    if abs(adjustment) > 1e-10:
+        projected = np.asarray(
+            _adjust_variable_bounded_sum(projected.tolist(), adjustment, lower, upper_array),
+            dtype=float,
+        )
+    return projected
+
+
 def _adjust_bounded_sum(values: Sequence[float], adjustment: float, lower: float, upper: float) -> List[float]:
     adjusted = list(values)
     if adjustment > 0:
         for idx, value in enumerate(adjusted):
             room = upper - value
+            delta = min(room, adjustment)
+            adjusted[idx] += delta
+            adjustment -= delta
+            if adjustment <= 1e-12:
+                break
+    else:
+        adjustment = -adjustment
+        for idx, value in enumerate(adjusted):
+            room = value - lower
+            delta = min(room, adjustment)
+            adjusted[idx] -= delta
+            adjustment -= delta
+            if adjustment <= 1e-12:
+                break
+    return adjusted
+
+
+def _adjust_variable_bounded_sum(
+    values: Sequence[float],
+    adjustment: float,
+    lower: float,
+    uppers: Sequence[float] | np.ndarray,
+) -> List[float]:
+    adjusted = list(values)
+    upper_array = np.asarray(uppers, dtype=float)
+    if adjustment > 0:
+        for idx, value in enumerate(adjusted):
+            room = float(upper_array[idx]) - value
             delta = min(room, adjustment)
             adjusted[idx] += delta
             adjustment -= delta
@@ -449,10 +587,11 @@ def objective_value(
     target_sectors: Optional[Dict[str, float]] = None,
     benchmark_returns: Optional[Dict[date, float]] = None,
     tax_alpha_mode: str = "closest",
-    tracking_error_penalty: float = 1.0,
-    tax_penalty: float = 1.0,
-    sector_penalty: float = 1.0,
-    concentration_penalty: float = 0.01,
+    tracking_error_penalty: float = 4.0,
+    tax_penalty: float = 0.20,
+    sector_penalty: float = 4.0,
+    concentration_penalty: float = 0.05,
+    index_anchor_penalty: float = 0.25,
     tracking_cache: Optional[_TrackingArrayCache] = None,
 ) -> float:
     if tax_alpha_mode not in {"closest", "at-least"}:
@@ -489,6 +628,10 @@ def objective_value(
             for sector in all_sectors
         )
     value += concentration_penalty * sum(weight * weight for weight in weights)
+    anchor_weights = index_normalized_weights(candidates)
+    value += index_anchor_penalty * sum(
+        (weight - anchor_weight) ** 2 for weight, anchor_weight in zip(weights, anchor_weights)
+    )
     return value
 
 
@@ -637,13 +780,14 @@ def optimize_selection(
         tracking_cache = _TrackingArrayCache(candidates, benchmark_returns)
     selected_by_ticker = {candidate.ticker: candidate for candidate in selected}
     universe_by_ticker = {candidate.ticker: candidate for candidate in candidates}
+    universe_weight_total = sum(max(0.0, candidate.index_weight) for candidate in candidates)
     by_sector: Dict[str, List[Candidate]] = {}
     for candidate in candidates:
         by_sector.setdefault(candidate.sector, []).append(candidate)
 
     def score(selection: Sequence[Candidate]) -> float:
         weights = index_normalized_weights(selection)
-        return objective_value(
+        value = objective_value(
             selection,
             weights,
             error_margin,
@@ -651,9 +795,13 @@ def optimize_selection(
             target_sectors if match_sectors else None,
             benchmark_returns=benchmark_returns,
             tax_alpha_mode=tax_alpha_mode,
-            sector_penalty=2.0 if match_sectors else 0.0,
+            sector_penalty=10.0 if match_sectors else 0.0,
             tracking_cache=tracking_cache,
         )
+        if universe_weight_total > 0:
+            coverage = sum(max(0.0, candidate.index_weight) for candidate in selection) / universe_weight_total
+            value += 25.0 * (1.0 - coverage) ** 2
+        return value
 
     best_selection = list(selected_by_ticker.values())
     best_score = score(best_selection)
@@ -706,14 +854,18 @@ def optimize_weights(
     tax_alpha_mode: str = "closest",
     iterations: int = 2000,
     learning_rate: float = 0.08,
-    tax_penalty: float = 1.0,
-    sector_penalty: float = 2.0,
-    concentration_penalty: float = 0.005,
+    tax_penalty: float = 0.20,
+    sector_penalty: float = 12.0,
+    concentration_penalty: float = 0.05,
     min_weight: float = 0.0,
     max_weight: Optional[float] = None,
     benchmark_returns: Optional[Dict[date, float]] = None,
-    tracking_error_penalty: float = 1.0,
-    index_anchor_penalty: float = 0.0,
+    tracking_error_penalty: float = 6.0,
+    index_anchor_penalty: float = 25.0,
+    sector_band: Optional[float] = 0.02,
+    beta_target: float = 1.0,
+    beta_band: float = 0.02,
+    beta_penalty: float = 4.0,
     show_progress: bool = False,
     progress_label: str = "Weights",
 ) -> List[float]:
@@ -723,14 +875,15 @@ def optimize_weights(
         raise ValueError("error_margin must be positive")
     if not candidates:
         raise ValueError("no candidates supplied")
-    max_weight_for_projection = max_weight if max_weight is not None else 1.0
-    anchor_weights_array = _project_to_bounded_simplex_array(
+    upper_bounds = _benchmark_aware_upper_bounds(candidates, min_weight, max_weight)
+    anchor_weights_array = _project_to_variable_bounded_simplex_array(
         index_normalized_weights(candidates),
         lower=min_weight,
-        upper=max_weight_for_projection,
+        uppers=upper_bounds,
     )
     weights_array = anchor_weights_array.copy()
     tax_values = np.asarray([candidate.tax_alpha for candidate in candidates], dtype=float)
+    beta_values = np.asarray([candidate.beta for candidate in candidates], dtype=float)
     sector_matrix, target_sector_values = _sector_exposure_arrays(candidates, target_sectors)
     tax_scale = max(abs(target_tax_alpha), 0.005)
     tracking_model = prepare_tracking_model(candidates, benchmark_returns)
@@ -757,6 +910,8 @@ def optimize_weights(
         if sector_matrix is not None and target_sector_values is not None:
             sector_residual = sector_matrix @ weights - target_sector_values
             value += sector_penalty * float(sector_residual @ sector_residual)
+        beta_delta = float(weights @ beta_values) - beta_target
+        value += beta_penalty * (beta_delta / max(beta_band, 0.005)) ** 2
         value += concentration_penalty * float(weights @ weights)
         value += index_anchor_penalty * float((weights - anchor_weights_array) @ (weights - anchor_weights_array))
         return float(value)
@@ -773,6 +928,8 @@ def optimize_weights(
         if sector_matrix is not None and target_sector_values is not None:
             sector_residual = sector_matrix @ weights - target_sector_values
             gradient += 2.0 * sector_penalty * (sector_matrix.T @ sector_residual)
+        beta_delta = float(weights @ beta_values) - beta_target
+        gradient += 2.0 * beta_penalty * beta_delta * beta_values / (max(beta_band, 0.005) ** 2)
         gradient += 2.0 * concentration_penalty * weights
         gradient += 2.0 * index_anchor_penalty * (weights - anchor_weights_array)
         return gradient
@@ -783,6 +940,40 @@ def optimize_weights(
     def tracking_constraint_gradient(weights: np.ndarray) -> np.ndarray:
         active_gradient = np.asarray(_active_variance_gradient(weights, tracking_model), dtype=float)
         return -tracking_model.annualization * active_gradient
+
+    constraints = [
+        {
+            "type": "eq",
+            "fun": lambda weights: float(np.sum(weights) - 1.0),
+            "jac": lambda weights: np.ones_like(weights),
+        },
+        {
+            "type": "ineq",
+            "fun": tracking_constraint,
+            "jac": tracking_constraint_gradient,
+        },
+    ]
+    if sector_matrix is not None and target_sector_values is not None and sector_band is not None:
+        sector_limit = max(float(sector_band), 0.0)
+        for row_index in range(sector_matrix.shape[0]):
+            row = sector_matrix[row_index].copy()
+            target_value = float(target_sector_values[row_index])
+            constraints.append(
+                {
+                    "type": "ineq",
+                    "fun": lambda weights, row=row, target_value=target_value: sector_limit
+                    - float(row @ weights - target_value),
+                    "jac": lambda weights, row=row: -row,
+                }
+            )
+            constraints.append(
+                {
+                    "type": "ineq",
+                    "fun": lambda weights, row=row, target_value=target_value: sector_limit
+                    + float(row @ weights - target_value),
+                    "jac": lambda weights, row=row: row,
+                }
+            )
 
     progress_bar = tqdm(total=max_iterations, desc=progress_label, unit="iter") if show_progress else None
 
@@ -796,33 +987,28 @@ def optimize_weights(
             weights_array,
             method="SLSQP",
             jac=objective_gradient,
-            bounds=[(min_weight, max_weight_for_projection)] * len(candidates),
-            constraints=[
-                {
-                    "type": "eq",
-                    "fun": lambda weights: float(np.sum(weights) - 1.0),
-                    "jac": lambda weights: np.ones_like(weights),
-                },
-                {
-                    "type": "ineq",
-                    "fun": tracking_constraint,
-                    "jac": tracking_constraint_gradient,
-                },
-            ],
+            bounds=[(min_weight, float(upper)) for upper in upper_bounds],
+            constraints=constraints,
             callback=update_progress if progress_bar is not None else None,
             options={"maxiter": max_iterations, "ftol": 1e-12, "disp": False},
         )
-    finally:
+    except BaseException:
         if progress_bar is not None:
             progress_bar.close()
+        raise
+    if progress_bar is not None:
+        if result.success and progress_bar.n < max_iterations:
+            progress_bar.set_postfix_str(f"converged after {progress_bar.n} iter")
+            progress_bar.refresh()
+        progress_bar.close()
 
     if result.x is not None and len(result.x) == len(candidates) and np.all(np.isfinite(result.x)):
         weights_array = np.asarray(result.x, dtype=float)
 
-    weights_array = _project_to_bounded_simplex_array(
+    weights_array = _project_to_variable_bounded_simplex_array(
         weights_array,
         lower=min_weight,
-        upper=max_weight_for_projection,
+        uppers=upper_bounds,
     )
     if tracking_error(weights_array, tracking_model) > error_margin + 1e-8:
         repaired = _repair_tracking_error(weights_array, anchor_weights_array, tracking_model, error_margin)
@@ -860,6 +1046,116 @@ def _repair_tracking_error(
 
 def sector_error(sectors: Dict[str, float], targets: Dict[str, float]) -> float:
     return sum(abs(sectors.get(sector, 0.0) - targets.get(sector, 0.0)) for sector in set(sectors).union(targets))
+
+
+def _object_to_float(value: object) -> Optional[float]:
+    if not isinstance(value, (int, float, str)):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _add_percent_metric_aliases(metrics: Dict[str, object]) -> None:
+    tracking_error_value = _object_to_float(metrics.get("tracking_error"))
+    if tracking_error_value is not None:
+        metrics["tracking_error_annualized_pct"] = tracking_error_value * 100.0
+    active_share_value = _object_to_float(metrics.get("active_share"))
+    if active_share_value is not None:
+        metrics["active_share_pct"] = active_share_value * 100.0
+    max_weight_value = _object_to_float(metrics.get("max_weight"))
+    if max_weight_value is not None:
+        metrics["max_weight_pct"] = max_weight_value * 100.0
+    sector_abs_error_value = _object_to_float(metrics.get("sector_abs_error"))
+    if sector_abs_error_value is not None:
+        metrics["sector_absolute_error_pct"] = sector_abs_error_value * 100.0
+    gross_loss_value = _object_to_float(metrics.get("gross_harvestable_loss_rate"))
+    if gross_loss_value is not None:
+        metrics["gross_harvestable_loss_rate_pct_per_year"] = gross_loss_value * 100.0
+    simulated_tax_alpha_value = _object_to_float(metrics.get("simulated_tax_alpha"))
+    if simulated_tax_alpha_value is not None:
+        metrics["simulated_after_tax_alpha_pct_per_year"] = simulated_tax_alpha_value * 100.0
+
+
+def _constraint_warnings(metrics: Mapping[str, object], sample_size: int) -> List[str]:
+    warnings: List[str] = []
+
+    def number(key: str) -> Optional[float]:
+        value = metrics.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+        return None
+
+    tracking_error_value = number("tracking_error")
+    if tracking_error_value is not None:
+        if tracking_error_value > 0.02:
+            warnings.append("tracking_error_above_2pct_hard_warning")
+        elif tracking_error_value > 0.015:
+            warnings.append("tracking_error_above_1_5pct_warning")
+    active_share_value = number("active_share")
+    if active_share_value is not None:
+        if active_share_value > 0.50:
+            warnings.append("active_share_above_50pct_hard_warning")
+        elif active_share_value > 0.35:
+            warnings.append("active_share_above_35pct_warning")
+    effective_names = number("effective_number_of_names")
+    if effective_names is not None and sample_size >= 250 and effective_names <= 100.0:
+        warnings.append("effective_names_not_above_100")
+    sector_abs_error = number("sector_abs_error")
+    if sector_abs_error is not None:
+        if sector_abs_error > 0.05:
+            warnings.append("sector_absolute_error_above_5pct_hard_warning")
+        elif sector_abs_error > 0.02:
+            warnings.append("sector_absolute_error_above_2pct_warning")
+    max_weight = number("max_weight")
+    if max_weight is not None and sample_size >= 50 and max_weight > _default_scalar_max_weight(sample_size) + 1e-8:
+        warnings.append("max_weight_above_default_direct_indexing_cap")
+    beta = number("beta")
+    if beta is not None and abs(beta - 1.0) > 0.02:
+        warnings.append("beta_outside_0_98_to_1_02")
+    return warnings
+
+
+def _hard_constraint_violations(
+    metrics: Mapping[str, object],
+    candidates: Sequence[Candidate],
+    weights: Sequence[float],
+    sample_size: int,
+) -> List[str]:
+    if sample_size < 50:
+        return []
+    violations: List[str] = []
+
+    def number(key: str) -> Optional[float]:
+        value = metrics.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+        return None
+
+    beta = number("beta")
+    if beta is not None and not 0.98 <= beta <= 1.02:
+        violations.append(f"beta={beta:.4f} outside 0.98-1.02")
+    tracking_error_value = number("tracking_error")
+    if tracking_error_value is not None and tracking_error_value > 0.02:
+        violations.append(f"tracking_error={tracking_error_value:.4f} above 0.0200")
+    active_share_value = number("active_share")
+    if active_share_value is not None and active_share_value > 0.50:
+        violations.append(f"active_share={active_share_value:.4f} above 0.5000")
+    effective_names = number("effective_number_of_names")
+    if sample_size >= 250 and effective_names is not None and effective_names < 100.0:
+        violations.append(f"effective_names={effective_names:.1f} below 100")
+    sector_abs_error = number("sector_abs_error")
+    if sector_abs_error is not None and sector_abs_error > 0.05:
+        violations.append(f"sector_abs_error={sector_abs_error:.4f} above 0.0500")
+    for candidate, weight in zip(candidates, weights):
+        allowed_weight = max(0.02, max(0.0, candidate.index_weight))
+        if weight > allowed_weight + 1e-8:
+            violations.append(
+                f"{candidate.ticker} weight={weight:.4f} above allowed {allowed_weight:.4f}"
+            )
+            break
+    return violations
 
 
 def _return_correlation(
@@ -1006,11 +1302,14 @@ def _empty_harvest_simulation(
         "total_transaction_cost": 0.0,
         "total_replacement_cost": 0.0,
         "total_net_tax_benefit": 0.0,
+        "full_liquidation_after_tax_benefit": 0.0,
         "portfolio_simulated_tax_alpha": 0.0,
         "portfolio_harvest_annualized_return": 0.0,
         "benchmark_annualized_return": 0.0,
         "portfolio_harvest_active_return": 0.0,
+        "portfolio_harvest_active_return_pct_per_year": 0.0,
         "portfolio_harvest_tracking_error": 0.0,
+        "portfolio_harvest_tracking_error_annualized_pct": 0.0,
         "portfolio_harvest_beta": 0.0,
         "portfolio_harvest_correlation": 0.0,
         "portfolio_harvest_observations": 0,
@@ -1019,6 +1318,17 @@ def _empty_harvest_simulation(
         "rebalance_dates": [],
         "skipped_no_replacement": 0,
         "skipped_nonpositive_net_benefit": 0,
+        "skipped_constraint_violation": 0,
+        "skipped_harvests_by_reason": {},
+        "harvest_diagnostics": [],
+        "skipped_harvest_events": [],
+        "cash_drag": 0.0,
+        "immediate_tax_savings_pct_per_year": 0.0,
+        "immediate_net_tax_savings_pct_per_year": 0.0,
+        "realized_loss_rate_pct_per_year": 0.0,
+        "simulated_after_tax_alpha_pct_per_year": 0.0,
+        "full_liquidation_after_tax_alpha_pct_per_year": 0.0,
+        "terminal_after_tax_wealth_difference_pct": 0.0,
         "period_realized_losses": [],
         "sample_events": [],
     }
@@ -1058,6 +1368,344 @@ def _annualized_return(values: Sequence[float], years: float) -> float:
     return (values[-1] / values[0]) ** (1.0 / years) - 1.0
 
 
+def _benchmark_weight_map(universe: Sequence[Candidate]) -> Dict[str, float]:
+    total = sum(max(0.0, candidate.index_weight) for candidate in universe)
+    if total <= 0:
+        return {}
+    return {
+        candidate.ticker: max(0.0, candidate.index_weight) / total
+        for candidate in universe
+    }
+
+
+def _sector_targets_from_candidates(universe: Sequence[Candidate]) -> Dict[str, float]:
+    total = sum(max(0.0, candidate.index_weight) for candidate in universe)
+    if total <= 0:
+        return {}
+    targets: Dict[str, float] = {}
+    for candidate in universe:
+        targets[candidate.sector] = targets.get(candidate.sector, 0.0) + max(0.0, candidate.index_weight) / total
+    return targets
+
+
+def _active_share_from_weight_maps(
+    portfolio_weights: Mapping[str, float],
+    benchmark_weights: Mapping[str, float],
+) -> float:
+    tickers = set(portfolio_weights).union(benchmark_weights)
+    return 0.5 * sum(abs(portfolio_weights.get(ticker, 0.0) - benchmark_weights.get(ticker, 0.0)) for ticker in tickers)
+
+
+def _values_from_lots(
+    lots: Sequence[SimulatedHarvestLot],
+    day_prices: Mapping[str, float],
+) -> Tuple[Dict[str, float], float]:
+    values: Dict[str, float] = {}
+    total_value = 0.0
+    for lot in lots:
+        price = day_prices.get(lot.ticker, 0.0)
+        if price <= 0:
+            continue
+        value = lot.shares * price
+        if value <= 0:
+            continue
+        values[lot.ticker] = values.get(lot.ticker, 0.0) + value
+        total_value += value
+    if total_value <= 0:
+        return {}, 0.0
+    return values, total_value
+
+
+def _weights_from_values(
+    values: Mapping[str, float],
+    total_value: float,
+) -> Dict[str, float]:
+    if total_value <= 0:
+        return {}
+    return {
+        ticker: value / total_value
+        for ticker, value in values.items()
+        if value > 0
+    }
+
+
+def _replay_snapshot_from_values(
+    values_by_ticker: Mapping[str, float],
+    total_value: float,
+    candidate_by_ticker: Mapping[str, Candidate],
+    benchmark_weights: Mapping[str, float],
+    target_sectors: Mapping[str, float],
+    tracking_cache: _TrackingArrayCache,
+    *,
+    include_tracking: bool = True,
+) -> Dict[str, object]:
+    weight_by_ticker = _weights_from_values(values_by_ticker, total_value)
+    candidates: List[Candidate] = []
+    weights: List[float] = []
+    missing_weight = 0.0
+    for ticker, weight in sorted(weight_by_ticker.items()):
+        candidate = candidate_by_ticker.get(ticker)
+        if candidate is None:
+            missing_weight += weight
+            continue
+        candidates.append(candidate)
+        weights.append(weight)
+
+    sectors = _sector_vector(candidates, weights) if candidates else {}
+    cached_tracking = (
+        tracking_cache.tracking_error(candidates, weights)
+        if candidates and include_tracking
+        else None
+    )
+    tracking_error_value = cached_tracking[0] if cached_tracking is not None else 0.0
+    beta = sum(weight * candidate.beta for candidate, weight in zip(candidates, weights))
+    active_share_value = (
+        _active_share_from_weight_maps(weight_by_ticker, benchmark_weights)
+        if benchmark_weights
+        else 0.0
+    )
+    effective_names = 1.0 / sum(weight * weight for weight in weight_by_ticker.values()) if weight_by_ticker else 0.0
+    max_weight = max(weight_by_ticker.values()) if weight_by_ticker else 0.0
+    sector_abs_error = sector_error(dict(sectors), dict(target_sectors)) if target_sectors else 0.0
+    return {
+        "portfolio_value": total_value,
+        "cash_weight": 0.0,
+        "missing_candidate_weight": missing_weight,
+        "tracking_error": tracking_error_value,
+        "tracking_error_annualized_pct": tracking_error_value * 100.0,
+        "beta": beta,
+        "active_share": active_share_value,
+        "active_share_pct": active_share_value * 100.0,
+        "max_weight": max_weight,
+        "max_weight_pct": max_weight * 100.0,
+        "effective_names": effective_names,
+        "sector_abs_error": sector_abs_error,
+        "sector_absolute_error_pct": sector_abs_error * 100.0,
+        "position_count": len(weight_by_ticker),
+        "weights": weight_by_ticker,
+        "sectors": sectors,
+    }
+
+
+def _replay_snapshot(
+    lots: Sequence[SimulatedHarvestLot],
+    day_prices: Mapping[str, float],
+    candidate_by_ticker: Mapping[str, Candidate],
+    benchmark_weights: Mapping[str, float],
+    target_sectors: Mapping[str, float],
+    tracking_cache: _TrackingArrayCache,
+) -> Dict[str, object]:
+    values_by_ticker, total_value = _values_from_lots(lots, day_prices)
+    return _replay_snapshot_from_values(
+        values_by_ticker,
+        total_value,
+        candidate_by_ticker,
+        benchmark_weights,
+        target_sectors,
+        tracking_cache,
+    )
+
+
+def _snapshot_number(snapshot: Mapping[str, object], key: str) -> float:
+    value = snapshot.get(key)
+    return float(value) if isinstance(value, (int, float)) else 0.0
+
+
+def _replay_violation_score(snapshot: Mapping[str, object], constraints: ReplayConstraintConfig) -> float:
+    score = 0.0
+    tracking_error_value = _snapshot_number(snapshot, "tracking_error")
+    score += max(0.0, tracking_error_value - constraints.path_tracking_error_limit) / max(
+        constraints.path_tracking_error_limit,
+        0.005,
+    )
+    beta = _snapshot_number(snapshot, "beta")
+    score += max(0.0, abs(beta - constraints.beta_target) - constraints.beta_band) / max(
+        constraints.beta_band,
+        0.005,
+    )
+    sector_abs_error = _snapshot_number(snapshot, "sector_abs_error")
+    score += max(0.0, sector_abs_error - constraints.sector_abs_error_limit) / max(
+        constraints.sector_abs_error_limit,
+        0.005,
+    )
+    active_share_value = _snapshot_number(snapshot, "active_share")
+    score += max(0.0, active_share_value - constraints.active_share_limit) / max(
+        constraints.active_share_limit,
+        0.01,
+    )
+    max_weight = _snapshot_number(snapshot, "max_weight")
+    if constraints.max_weight_limit is not None:
+        score += max(0.0, max_weight - constraints.max_weight_limit) / max(
+            constraints.max_weight_limit,
+            0.005,
+        )
+    cash_weight = _snapshot_number(snapshot, "cash_weight")
+    score += max(0.0, cash_weight - constraints.cash_weight_limit) / max(
+        constraints.cash_weight_limit,
+        1e-6,
+    )
+    return score
+
+
+def _replay_violations(snapshot: Mapping[str, object], constraints: ReplayConstraintConfig) -> List[str]:
+    violations: List[str] = []
+    if _snapshot_number(snapshot, "tracking_error") > constraints.path_tracking_error_limit + 1e-12:
+        violations.append("tracking_error")
+    if abs(_snapshot_number(snapshot, "beta") - constraints.beta_target) > constraints.beta_band + 1e-12:
+        violations.append("beta")
+    if _snapshot_number(snapshot, "sector_abs_error") > constraints.sector_abs_error_limit + 1e-12:
+        violations.append("sector_abs_error")
+    if _snapshot_number(snapshot, "active_share") > constraints.active_share_limit + 1e-12:
+        violations.append("active_share")
+    if (
+        constraints.max_weight_limit is not None
+        and _snapshot_number(snapshot, "max_weight") > constraints.max_weight_limit + 1e-12
+    ):
+        violations.append("max_weight")
+    if _snapshot_number(snapshot, "cash_weight") > constraints.cash_weight_limit + 1e-12:
+        violations.append("cash")
+    return violations
+
+
+def _replay_constraints_allow(
+    before: Mapping[str, object],
+    after: Mapping[str, object],
+    constraints: ReplayConstraintConfig,
+    selected_count: int,
+) -> Tuple[bool, List[str]]:
+    if selected_count < constraints.enforce_min_names:
+        return True, []
+    after_violations = _replay_violations(after, constraints)
+    if not after_violations:
+        return True, []
+    return False, after_violations
+
+
+def _replacement_plans(pool: Sequence[Candidate], replacement_count: int) -> List[List[Candidate]]:
+    if not pool or replacement_count <= 0:
+        return []
+    count = min(replacement_count, len(pool))
+    if count == 1:
+        return [[candidate] for candidate in pool[:8]]
+    if count == 2:
+        limited = list(pool[:6])
+        plans: List[List[Candidate]] = []
+        if len(limited) >= 2:
+            plans.append([limited[0], limited[1]])
+        for candidate in limited[2:]:
+            plans.append([limited[0], candidate])
+        if len(limited) >= 4:
+            plans.append([limited[1], limited[2]])
+        return plans or [limited[:count]]
+    return [list(pool[:count])]
+
+
+def _choose_replacement_plan(
+    pool: Sequence[Candidate],
+    replacement_count: int,
+    market_value: float,
+    day_prices: Mapping[str, float],
+    base_values_by_ticker: Mapping[str, float],
+    base_value: float,
+    candidate_by_ticker: Mapping[str, Candidate],
+    benchmark_weights: Mapping[str, float],
+    target_sectors: Mapping[str, float],
+    tracking_cache: _TrackingArrayCache,
+    replacement_scores: Dict[Tuple[str, str], Dict[str, float]],
+    correlation_cache: _ReturnCorrelationCache,
+    source_candidate: Candidate,
+    before_snapshot: Mapping[str, object],
+    constraints: ReplayConstraintConfig,
+    selected_count: int,
+) -> Tuple[List[Tuple[Candidate, float, float]], Dict[str, object], List[str]]:
+    best_plan: List[Tuple[Candidate, float, float]] = []
+    best_snapshot: Dict[str, object] = {}
+    best_violations: List[str] = []
+    best_score = float("inf")
+    best_allowed_score = float("inf")
+    cheap_candidates: List[
+        Tuple[float, List[Tuple[Candidate, float, float]], Dict[str, float], float, float]
+    ] = []
+
+    for plan in _replacement_plans(pool, replacement_count):
+        allocation_plan: List[Tuple[Candidate, float, float]] = []
+        for replacement, allocation in _replacement_allocations(plan, market_value):
+            replacement_price = day_prices.get(replacement.ticker)
+            if replacement_price and replacement_price > 0 and allocation > 0:
+                allocation_plan.append((replacement, allocation, replacement_price))
+        if not allocation_plan:
+            continue
+
+        proposed_values = dict(base_values_by_ticker)
+        for replacement, allocation, _ in allocation_plan:
+            proposed_values[replacement.ticker] = proposed_values.get(replacement.ticker, 0.0) + allocation
+        proposed_total = base_value + sum(allocation for _, allocation, _ in allocation_plan)
+        cheap_snapshot = _replay_snapshot_from_values(
+            proposed_values,
+            proposed_total,
+            candidate_by_ticker,
+            benchmark_weights,
+            target_sectors,
+            tracking_cache,
+            include_tracking=False,
+        )
+        similarity_score = sum(
+            _cached_replacement_similarity(
+                source_candidate,
+                replacement,
+                replacement_scores,
+                correlation_cache,
+            )["score"]
+            for replacement, _, _ in allocation_plan
+        ) / len(allocation_plan)
+        beta_delta = abs(_snapshot_number(cheap_snapshot, "beta") - constraints.beta_target)
+        sector_abs_error = _snapshot_number(cheap_snapshot, "sector_abs_error")
+        active_share_value = _snapshot_number(cheap_snapshot, "active_share")
+        max_weight = _snapshot_number(cheap_snapshot, "max_weight")
+        cheap_score = (
+            4.0 * (beta_delta / max(constraints.beta_band, 0.005)) ** 2
+            + 3.0 * (sector_abs_error / max(constraints.sector_band, 0.005)) ** 2
+            + 1.5 * active_share_value**2
+            + 0.5 * max_weight**2
+            + 0.1 * similarity_score
+        )
+        cheap_candidates.append(
+            (cheap_score, allocation_plan, proposed_values, proposed_total, similarity_score)
+        )
+
+    for cheap_score, allocation_plan, proposed_values, proposed_total, _ in sorted(
+        cheap_candidates,
+        key=lambda item: item[0],
+    )[:3]:
+        snapshot = _replay_snapshot_from_values(
+            proposed_values,
+            proposed_total,
+            candidate_by_ticker,
+            benchmark_weights,
+            target_sectors,
+            tracking_cache,
+        )
+        allowed, violations = _replay_constraints_allow(before_snapshot, snapshot, constraints, selected_count)
+        tracking_error_value = _snapshot_number(snapshot, "tracking_error")
+        score = (
+            8.0 * (tracking_error_value / max(constraints.tracking_error_limit, 0.005)) ** 2
+            + cheap_score
+        )
+        if allowed and score < best_allowed_score:
+            best_allowed_score = score
+            best_score = score
+            best_plan = allocation_plan
+            best_snapshot = snapshot
+            best_violations = violations
+        elif not best_plan and score < best_score:
+            best_score = score
+            best_plan = allocation_plan
+            best_snapshot = snapshot
+            best_violations = violations
+
+    return best_plan, best_snapshot, best_violations
+
+
 def _harvest_path_metrics(
     portfolio_values: Sequence[float],
     benchmark_values: Sequence[float],
@@ -1081,11 +1729,15 @@ def _harvest_path_metrics(
     covariance = _sample_covariance(portfolio_returns, benchmark_returns) if observation_count >= 2 else 0.0
     correlation_denominator = math.sqrt(portfolio_variance * benchmark_variance)
 
+    tracking_error_value = math.sqrt(max(active_variance, 0.0) * periods_per_year)
+    active_return_value = active_mean * periods_per_year
     return {
         "portfolio_harvest_annualized_return": _annualized_return(portfolio_values, years),
         "benchmark_annualized_return": _annualized_return(benchmark_values, years),
-        "portfolio_harvest_active_return": active_mean * periods_per_year,
-        "portfolio_harvest_tracking_error": math.sqrt(max(active_variance, 0.0) * periods_per_year),
+        "portfolio_harvest_active_return": active_return_value,
+        "portfolio_harvest_active_return_pct_per_year": active_return_value * 100.0,
+        "portfolio_harvest_tracking_error": tracking_error_value,
+        "portfolio_harvest_tracking_error_annualized_pct": tracking_error_value * 100.0,
         "portfolio_harvest_beta": covariance / benchmark_variance if benchmark_variance > 0 else 0.0,
         "portfolio_harvest_correlation": covariance / correlation_denominator if correlation_denominator > 0 else 0.0,
         "portfolio_harvest_observations": observation_count,
@@ -1315,7 +1967,7 @@ def _rebalance_lots_to_targets(
         is_active = active_tickers is None or candidate.ticker in active_tickers
         has_price = price_table.get(candidate.ticker, {}).get(day, 0.0) > 0
         if is_banned or not is_active or not has_price:
-            return list(lots), False
+            continue
         available_targets.append((candidate, weight))
 
     target_weight_total = sum(weight for _, weight in available_targets)
@@ -1399,6 +2051,8 @@ def simulate_portfolio_harvests(
     sample_event_limit: int = 20,
     historical_holdings: Optional[Mapping[date, Sequence[Holding]]] = None,
     harvest_frequency: Optional[str] = None,
+    on_progress: Optional[Callable[[int, int, str], None]] = None,
+    max_weight_limit: Optional[float] = None,
 ) -> Dict[str, object]:
     tax_frequency = harvest_frequency or rebalance_frequency
     benchmark_points = prices.get(benchmark_ticker)
@@ -1428,10 +2082,20 @@ def simulate_portfolio_harvests(
     tickers = {candidate.ticker for candidate in universe}.union(candidate.ticker for candidate in selected)
     table = _price_table(tickers, prices, schedule)
     tracking_cache = _TrackingArrayCache(universe, benchmark_returns)
+    benchmark_weights = _benchmark_weight_map(universe)
+    target_sectors = _sector_targets_from_candidates(universe)
+    construction_tracking_limit = min(error_margin, 0.02)
+    constraints = ReplayConstraintConfig(
+        tracking_error_limit=construction_tracking_limit,
+        path_tracking_error_limit=min(max(construction_tracking_limit * 1.25, 0.015), 0.025),
+        max_weight_limit=max_weight_limit
+        if max_weight_limit is not None
+        else (_default_scalar_max_weight(len(selected)) if len(selected) >= 50 else None),
+    )
     candidate_scores = {
         candidate.ticker: candidate_score(
             candidate,
-            error_margin,
+            construction_tracking_limit,
             target_tax_alpha,
             benchmark_returns,
             tax_alpha_mode,
@@ -1459,8 +2123,15 @@ def simulate_portfolio_harvests(
     start_day = None
     for day in schedule:
         active_tickers = _active_historical_tickers(historical_holdings, day)
-        selected_are_active = active_tickers is None or all(candidate.ticker in active_tickers for candidate, _ in selected_pairs)
-        if selected_are_active and all(table.get(candidate.ticker, {}).get(day, 0.0) > 0 for candidate, _ in selected_pairs):
+        selected_are_active = active_tickers is None or all(
+            candidate.ticker in active_tickers
+            for candidate, _ in selected_pairs
+        )
+        selected_have_prices = all(
+            table.get(candidate.ticker, {}).get(day, 0.0) > 0
+            for candidate, _ in selected_pairs
+        )
+        if selected_are_active and selected_have_prices:
             start_day = day
             break
     if start_day is None:
@@ -1497,11 +2168,30 @@ def simulate_portfolio_harvests(
     rebalance_count = 0
     skipped_no_replacement = 0
     skipped_nonpositive_net_benefit = 0
+    skipped_constraint_violation = 0
+    skipped_harvests_by_reason: Dict[str, int] = {}
     banned_until: Dict[str, date] = {}
     portfolio_values: List[float] = []
     period_rows: Dict[date, Dict[str, float]] = {}
+    period_replacement_names: Dict[date, List[str]] = {}
     sample_events: List[Dict[str, object]] = []
+    harvest_diagnostics: List[Dict[str, object]] = []
+    skipped_harvest_events: List[Dict[str, object]] = []
     rebalance_dates: List[str] = []
+
+    def record_skip(reason: str, event: Optional[Dict[str, object]] = None) -> None:
+        skipped_harvests_by_reason[reason] = skipped_harvests_by_reason.get(reason, 0) + 1
+        if event is not None and len(skipped_harvest_events) < sample_event_limit:
+            skipped_harvest_events.append(event)
+
+    def report_progress(count: int) -> None:
+        if on_progress is None:
+            return
+        on_progress(
+            count,
+            len(simulation_dates),
+            f"lots: {len(lots)}, harvests: {harvest_count}, rebalances: {rebalance_count}",
+        )
 
     for day_index, day in enumerate(simulation_dates):
         day_prices = {
@@ -1517,6 +2207,7 @@ def simulate_portfolio_harvests(
         portfolio_values.append(portfolio_value)
 
         if day_index == 0:
+            report_progress(day_index + 1)
             continue
 
         pit_active_tickers = _active_historical_tickers(historical_holdings, day)
@@ -1530,7 +2221,7 @@ def simulate_portfolio_harvests(
                 if banned_day >= day
             }
             sold_this_period: Set[str] = set()
-            for lot in lots:
+            for lot_index, lot in enumerate(lots):
                 price = day_prices.get(lot.ticker)
                 if price is None or price <= 0 or lot.basis <= 0:
                     next_lots.append(lot)
@@ -1550,6 +2241,15 @@ def simulate_portfolio_harvests(
                 net_tax_benefit = tax_benefit - transaction_cost - replacement_cost
                 if net_tax_benefit <= 0:
                     skipped_nonpositive_net_benefit += 1
+                    record_skip(
+                        "nonpositive_net_benefit",
+                        {
+                            "date": day.isoformat(),
+                            "ticker": lot.ticker,
+                            "realized_loss": realized_loss,
+                            "net_tax_benefit": net_tax_benefit,
+                        },
+                    )
                     next_lots.append(lot)
                     next_lot_tickers.add(lot.ticker)
                     continue
@@ -1561,7 +2261,7 @@ def simulate_portfolio_harvests(
                     next_lot_tickers.add(lot.ticker)
                     continue
                 relaxed_unavailable = banned_tickers.union(sold_this_period, {lot.ticker})
-                replacements = _same_sector_replacements(
+                replacement_pool = _same_sector_replacements(
                     universe,
                     source_candidate,
                     unavailable,
@@ -1569,20 +2269,88 @@ def simulate_portfolio_harvests(
                     day,
                     candidate_scores,
                     replacement_scores,
-                    replacement_count,
+                    max(replacement_count * 8, 14),
                     active_tickers=pit_active_tickers,
                     ranked_replacements=ranked_replacements,
                     correlation_cache=correlation_cache,
                     relaxed_unavailable=relaxed_unavailable,
                     day_prices=day_prices,
                 )
-                allocation_plan: List[Tuple[Candidate, float, float]] = []
-                for replacement, allocation in _replacement_allocations(replacements, market_value):
-                    replacement_price = day_prices.get(replacement.ticker)
-                    if replacement_price and replacement_price > 0 and allocation > 0:
-                        allocation_plan.append((replacement, allocation, replacement_price))
+                before_snapshot = _replay_snapshot(
+                    lots,
+                    day_prices,
+                    candidate_by_ticker,
+                    benchmark_weights,
+                    target_sectors,
+                    tracking_cache,
+                )
+                remaining_lots = list(lots[lot_index + 1 :])
+                lots_after_replacement_base = next_lots + remaining_lots
+                base_values_by_ticker, base_value = _values_from_lots(
+                    lots_after_replacement_base,
+                    day_prices,
+                )
+                allocation_plan, after_snapshot, replacement_violations = _choose_replacement_plan(
+                    replacement_pool,
+                    replacement_count,
+                    market_value,
+                    day_prices,
+                    base_values_by_ticker,
+                    base_value,
+                    candidate_by_ticker,
+                    benchmark_weights,
+                    target_sectors,
+                    tracking_cache,
+                    replacement_scores,
+                    correlation_cache,
+                    source_candidate,
+                    before_snapshot,
+                    constraints,
+                    len(selected_pairs),
+                )
                 if not allocation_plan:
                     skipped_no_replacement += 1
+                    record_skip(
+                        "no_replacement",
+                        {
+                            "date": day.isoformat(),
+                            "ticker": lot.ticker,
+                            "market_value": market_value,
+                            "cash_before": _snapshot_number(before_snapshot, "cash_weight"),
+                            "cash_after": _snapshot_number(before_snapshot, "cash_weight"),
+                        },
+                    )
+                    next_lots.append(lot)
+                    next_lot_tickers.add(lot.ticker)
+                    continue
+                allowed, violations = _replay_constraints_allow(
+                    before_snapshot,
+                    after_snapshot,
+                    constraints,
+                    len(selected_pairs),
+                )
+                if not allowed:
+                    skipped_constraint_violation += 1
+                    reason = "constraint_violation"
+                    record_skip(
+                        reason,
+                        {
+                            "date": day.isoformat(),
+                            "ticker": lot.ticker,
+                            "violations": violations,
+                            "replacement_candidates": [replacement.ticker for replacement, _, _ in allocation_plan],
+                            "cash_before": _snapshot_number(before_snapshot, "cash_weight"),
+                            "cash_after": _snapshot_number(after_snapshot, "cash_weight"),
+                            "tracking_error_before": _snapshot_number(before_snapshot, "tracking_error"),
+                            "tracking_error_after": _snapshot_number(after_snapshot, "tracking_error"),
+                            "beta_before": _snapshot_number(before_snapshot, "beta"),
+                            "beta_after": _snapshot_number(after_snapshot, "beta"),
+                            "active_share_before": _snapshot_number(before_snapshot, "active_share"),
+                            "active_share_after": _snapshot_number(after_snapshot, "active_share"),
+                            "sector_abs_error_before": _snapshot_number(before_snapshot, "sector_abs_error"),
+                            "sector_abs_error_after": _snapshot_number(after_snapshot, "sector_abs_error"),
+                        },
+                    )
                     next_lots.append(lot)
                     next_lot_tickers.add(lot.ticker)
                     continue
@@ -1643,6 +2411,9 @@ def simulate_portfolio_harvests(
                             "industry_match": bool(similarity["industry_match"]),
                         }
                     )
+                period_replacement_names.setdefault(day, []).extend(
+                    str(row["ticker"]) for row in replacement_event_rows
+                )
                 if len(sample_events) < sample_event_limit:
                     sample_events.append(
                         {
@@ -1655,6 +2426,49 @@ def simulate_portfolio_harvests(
                             "realized_loss": realized_loss,
                             "unrealized_return": unrealized_return,
                             "replacements": replacement_event_rows,
+                            "diagnostics_before": {
+                                "cash_weight": _snapshot_number(before_snapshot, "cash_weight"),
+                                "tracking_error": _snapshot_number(before_snapshot, "tracking_error"),
+                                "beta": _snapshot_number(before_snapshot, "beta"),
+                                "active_share": _snapshot_number(before_snapshot, "active_share"),
+                                "sector_abs_error": _snapshot_number(before_snapshot, "sector_abs_error"),
+                                "max_weight": _snapshot_number(before_snapshot, "max_weight"),
+                                "effective_names": _snapshot_number(before_snapshot, "effective_names"),
+                            },
+                            "diagnostics_after": {
+                                "cash_weight": _snapshot_number(after_snapshot, "cash_weight"),
+                                "tracking_error": _snapshot_number(after_snapshot, "tracking_error"),
+                                "beta": _snapshot_number(after_snapshot, "beta"),
+                                "active_share": _snapshot_number(after_snapshot, "active_share"),
+                                "sector_abs_error": _snapshot_number(after_snapshot, "sector_abs_error"),
+                                "max_weight": _snapshot_number(after_snapshot, "max_weight"),
+                                "effective_names": _snapshot_number(after_snapshot, "effective_names"),
+                            },
+                            "constraint_violations_after": replacement_violations,
+                        }
+                    )
+                if len(harvest_diagnostics) < sample_event_limit:
+                    harvest_diagnostics.append(
+                        {
+                            "date": day.isoformat(),
+                            "sold": lot.ticker,
+                            "replacement_names": [replacement.ticker for replacement, _, _ in allocation_plan],
+                            "realized_loss": realized_loss,
+                            "cash_before": _snapshot_number(before_snapshot, "cash_weight"),
+                            "cash_after": _snapshot_number(after_snapshot, "cash_weight"),
+                            "tracking_error_before": _snapshot_number(before_snapshot, "tracking_error"),
+                            "tracking_error_after": _snapshot_number(after_snapshot, "tracking_error"),
+                            "beta_before": _snapshot_number(before_snapshot, "beta"),
+                            "beta_after": _snapshot_number(after_snapshot, "beta"),
+                            "active_share_before": _snapshot_number(before_snapshot, "active_share"),
+                            "active_share_after": _snapshot_number(after_snapshot, "active_share"),
+                            "sector_abs_error_before": _snapshot_number(before_snapshot, "sector_abs_error"),
+                            "sector_abs_error_after": _snapshot_number(after_snapshot, "sector_abs_error"),
+                            "max_weight_before": _snapshot_number(before_snapshot, "max_weight"),
+                            "max_weight_after": _snapshot_number(after_snapshot, "max_weight"),
+                            "effective_names_before": _snapshot_number(before_snapshot, "effective_names"),
+                            "effective_names_after": _snapshot_number(after_snapshot, "effective_names"),
+                            "constraint_violations_after": replacement_violations,
                         }
                     )
             lots = next_lots
@@ -1672,17 +2486,24 @@ def simulate_portfolio_harvests(
                 rebalance_count += 1
                 rebalance_dates.append(day.isoformat())
 
+        report_progress(day_index + 1)
+
     end_day = simulation_dates[-1]
     years = max((end_day - start_day).days / 365.25, 1.0 / FREQUENCIES[tax_frequency])
     average_portfolio_value = sum(portfolio_values) / len(portfolio_values) if portfolio_values else 0.0
     ending_portfolio_value = portfolio_values[-1] if portfolio_values else 0.0
     total_net_tax_benefit = total_tax_benefit - total_transaction_cost - total_replacement_cost
+    full_liquidation_after_tax_benefit = total_net_tax_benefit - total_tax_benefit
     if average_portfolio_value > 0:
         portfolio_realized_loss_rate = total_realized_loss / average_portfolio_value / years
-        portfolio_simulated_tax_alpha = total_net_tax_benefit / average_portfolio_value / years
+        immediate_tax_savings_rate = total_tax_benefit / average_portfolio_value / years
+        immediate_net_tax_savings_rate = total_net_tax_benefit / average_portfolio_value / years
+        portfolio_simulated_tax_alpha = full_liquidation_after_tax_benefit / average_portfolio_value / years
     else:
         portfolio_realized_loss_rate = 0.0
         portfolio_simulated_tax_alpha = 0.0
+        immediate_tax_savings_rate = 0.0
+        immediate_net_tax_savings_rate = 0.0
     benchmark_lookup = _price_lookup_for_dates(benchmark_points, simulation_dates)
     aligned_portfolio_values = []
     aligned_benchmark_values = []
@@ -1696,6 +2517,11 @@ def simulate_portfolio_harvests(
         aligned_benchmark_values,
         years,
         tax_frequency,
+    )
+    terminal_after_tax_wealth_difference = (
+        full_liquidation_after_tax_benefit / ending_portfolio_value
+        if ending_portfolio_value > 0
+        else 0.0
     )
 
     return {
@@ -1715,20 +2541,44 @@ def simulate_portfolio_harvests(
         "total_transaction_cost": total_transaction_cost,
         "total_replacement_cost": total_replacement_cost,
         "total_net_tax_benefit": total_net_tax_benefit,
+        "full_liquidation_after_tax_benefit": full_liquidation_after_tax_benefit,
         "portfolio_simulated_tax_alpha": portfolio_simulated_tax_alpha,
+        "realized_loss_rate_pct_per_year": portfolio_realized_loss_rate * 100.0,
+        "immediate_tax_savings_pct_per_year": immediate_tax_savings_rate * 100.0,
+        "immediate_net_tax_savings_pct_per_year": immediate_net_tax_savings_rate * 100.0,
+        "simulated_after_tax_alpha_pct_per_year": portfolio_simulated_tax_alpha * 100.0,
+        "full_liquidation_after_tax_alpha_pct_per_year": portfolio_simulated_tax_alpha * 100.0,
+        "terminal_after_tax_wealth_difference_pct": terminal_after_tax_wealth_difference * 100.0,
+        "cash_drag": 0.0,
         **path_metrics,
         "harvest_count": harvest_count,
         "rebalance_count": rebalance_count,
         "rebalance_dates": rebalance_dates,
         "skipped_no_replacement": skipped_no_replacement,
         "skipped_nonpositive_net_benefit": skipped_nonpositive_net_benefit,
+        "skipped_constraint_violation": skipped_constraint_violation,
+        "skipped_harvests_by_reason": skipped_harvests_by_reason,
         "tax_rate": tax_rate,
         "harvest_threshold_pct": harvest_threshold_pct,
         "transaction_cost_bps": transaction_cost_bps,
         "replacement_cost_bps": replacement_cost_bps,
         "replacement_count": replacement_count,
         "wash_sale_days": wash_sale_days,
+        "replay_constraints": {
+            "tracking_error_limit": constraints.tracking_error_limit,
+            "path_tracking_error_limit": constraints.path_tracking_error_limit,
+            "sector_band": constraints.sector_band,
+            "sector_abs_error_limit": constraints.sector_abs_error_limit,
+            "beta_target": constraints.beta_target,
+            "beta_band": constraints.beta_band,
+            "active_share_limit": constraints.active_share_limit,
+            "cash_weight_limit": constraints.cash_weight_limit,
+            "max_weight_limit": constraints.max_weight_limit,
+            "enforce_min_names": constraints.enforce_min_names,
+        },
         "point_in_time_constituents": bool(historical_holdings),
+        "harvest_diagnostics": harvest_diagnostics,
+        "skipped_harvest_events": skipped_harvest_events,
         "period_realized_losses": [
             {
                 "date": day.isoformat(),
@@ -1738,6 +2588,7 @@ def simulate_portfolio_harvests(
                 "replacement_cost": row["replacement_cost"],
                 "net_tax_benefit": row["net_tax_benefit"],
                 "harvest_count": int(row["harvest_count"]),
+                "replacement_names": period_replacement_names.get(day, []),
             }
             for day, row in sorted(period_rows.items())
         ],
@@ -1783,25 +2634,26 @@ def construct_portfolio(
     if benchmark_returns is None:
         raise ValueError("benchmark_returns are required to optimize error margin")
     tax_frequency = harvest_frequency or rebalance_frequency
+    construction_error_margin = min(error_margin, 0.02)
     targets = sector_targets(holdings) if match_sectors else None
     tracking_cache = _TrackingArrayCache(candidates, benchmark_returns)
     initial = initial_selection(
         candidates,
         sample_size,
-        error_margin,
+        construction_error_margin,
         target_tax_alpha,
         benchmark_returns,
         match_sectors,
         targets,
         tax_alpha_mode=tax_alpha_mode,
-        index_weight_priority=False,
+        index_weight_priority=True,
         tracking_cache=tracking_cache,
     )
     selected = optimize_selection(
         candidates,
         initial,
         sample_size,
-        error_margin,
+        construction_error_margin,
         target_tax_alpha,
         benchmark_returns,
         targets,
@@ -1815,7 +2667,7 @@ def construct_portfolio(
     )
     weights = optimize_weights(
         selected,
-        error_margin,
+        construction_error_margin,
         target_tax_alpha,
         targets if match_sectors else None,
         tax_alpha_mode=tax_alpha_mode,
@@ -1825,6 +2677,7 @@ def construct_portfolio(
         benchmark_returns=benchmark_returns,
         tracking_error_penalty=tracking_error_penalty,
         index_anchor_penalty=index_anchor_penalty,
+        sector_band=0.02 if match_sectors else None,
         show_progress=show_progress,
         progress_label=f"{progress_label} weights",
     )
@@ -1834,6 +2687,15 @@ def construct_portfolio(
     sector_targets_out = targets or {}
     if sector_targets_out:
         metrics["sector_abs_error"] = sector_error(_sector_vector(selected, weights), sector_targets_out)
+    _add_percent_metric_aliases(metrics)
+    metrics["constraint_warnings"] = _constraint_warnings(metrics, sample_size)
+    hard_violations = _hard_constraint_violations(metrics, selected, weights, sample_size)
+    metrics["constraint_violations"] = hard_violations
+    if hard_violations:
+        raise ValueError(
+            "constructed portfolio violates hard benchmark-fidelity constraints: "
+            + "; ".join(hard_violations)
+        )
 
     positions = []
     for candidate, weight in sorted(zip(selected, weights), key=lambda item: item[1], reverse=True):
@@ -1859,6 +2721,7 @@ def construct_portfolio(
         "targets": {
             "sample_size": sample_size,
             "error_margin": error_margin,
+            "construction_tracking_error_limit": construction_error_margin,
             "estimated_tax_loss_alpha": target_tax_alpha,
             "tax_alpha_mode": tax_alpha_mode,
             "min_weight": min_weight,

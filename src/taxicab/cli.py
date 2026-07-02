@@ -157,14 +157,14 @@ def add_construct_arguments(
     parser.add_argument(
         "--tracking-error-penalty",
         type=float,
-        default=1.0,
-        help="Penalty strength for the tracking-error objective. Default: 1.",
+        default=6.0,
+        help="Penalty strength for the tracking-error objective. Default: 6.",
     )
     parser.add_argument(
         "--index-anchor-penalty",
         type=float,
-        default=1.0,
-        help="Penalty for moving away from selected index weights. Default: 1.",
+        default=25.0,
+        help="Penalty for moving away from selected index weights. Default: 25.",
     )
     progress = parser.add_mutually_exclusive_group()
     progress.add_argument(
@@ -444,11 +444,28 @@ def construct_from_args(
         progress_label=progress_label,
         replacement_universe=replacement_universe,
     )
-    attach_portfolio_context(portfolio, args.data_dir, prices, metadata, replacement_universe, historical_holdings)
+    attach_portfolio_context(
+        portfolio,
+        args.data_dir,
+        prices,
+        metadata,
+        replacement_universe,
+        historical_holdings,
+        show_progress=show_progress,
+    )
     return portfolio
 
 
-def attach_portfolio_context(portfolio, data_dir: str, prices, metadata, candidates, historical_holdings=None) -> None:
+def attach_portfolio_context(
+    portfolio,
+    data_dir: str,
+    prices,
+    metadata,
+    candidates,
+    historical_holdings=None,
+    *,
+    show_progress: bool = False,
+) -> None:
     for position in portfolio["positions"]:
         ticker = str(position.get("ticker", "")).upper()
         points = prices.get(ticker, [])
@@ -468,26 +485,70 @@ def attach_portfolio_context(portfolio, data_dir: str, prices, metadata, candida
         selected.append(candidate)
         weights.append(float(position.get("weight", 0.0)))
     if benchmark and benchmark in prices and selected:
-        simulation = simulate_portfolio_harvests(
-            selected,
-            weights,
-            candidates,
-            prices,
-            benchmark,
-            daily_returns(prices[benchmark]),
-            str(targets.get("rebalance_frequency", "quarterly")),
-            float(targets.get("error_margin", 0.05)),
-            float(targets.get("estimated_tax_loss_alpha", 0.0)),
-            tax_alpha_mode=str(targets.get("tax_alpha_mode", "closest")),
-            tax_rate=float(tax_assumptions.get("tax_rate", 0.30)),
-            harvest_threshold_pct=float(tax_assumptions.get("harvest_threshold_pct", 0.05)),
-            transaction_cost_bps=float(tax_assumptions.get("transaction_cost_bps", 5.0)),
-            replacement_cost_bps=float(tax_assumptions.get("replacement_cost_bps", 10.0)),
-            replacement_count=int(tax_assumptions.get("replacement_count", 2)),
-            wash_sale_days=int(tax_assumptions.get("wash_sale_days", 31)),
-            historical_holdings=historical_holdings or None,
-            harvest_frequency=str(targets.get("harvest_frequency", targets.get("rebalance_frequency", "quarterly"))),
-        )
+        harvest_progress = None
+
+        def update_harvest_progress(count: int, total: int, suffix: str) -> None:
+            nonlocal harvest_progress
+            if not show_progress:
+                return
+            if harvest_progress is None:
+                harvest_progress = tqdm(total=total, desc="Harvest replay", unit="day")
+            if suffix:
+                harvest_progress.set_postfix_str(suffix)
+            harvest_progress.update(max(count - harvest_progress.n, 0))
+
+        try:
+            simulation = simulate_portfolio_harvests(
+                selected,
+                weights,
+                candidates,
+                prices,
+                benchmark,
+                daily_returns(prices[benchmark]),
+                str(targets.get("rebalance_frequency", "quarterly")),
+                float(targets.get("error_margin", 0.05)),
+                float(targets.get("estimated_tax_loss_alpha", 0.0)),
+                tax_alpha_mode=str(targets.get("tax_alpha_mode", "closest")),
+                tax_rate=float(tax_assumptions.get("tax_rate", 0.30)),
+                harvest_threshold_pct=float(tax_assumptions.get("harvest_threshold_pct", 0.05)),
+                transaction_cost_bps=float(tax_assumptions.get("transaction_cost_bps", 5.0)),
+                replacement_cost_bps=float(tax_assumptions.get("replacement_cost_bps", 10.0)),
+                replacement_count=int(tax_assumptions.get("replacement_count", 2)),
+                wash_sale_days=int(tax_assumptions.get("wash_sale_days", 31)),
+                historical_holdings=historical_holdings or None,
+                harvest_frequency=str(
+                    targets.get(
+                        "harvest_frequency",
+                        targets.get("rebalance_frequency", "quarterly"),
+                    )
+                ),
+                on_progress=update_harvest_progress if show_progress else None,
+                max_weight_limit=(
+                    float(targets["max_weight"])
+                    if isinstance(targets.get("max_weight"), (int, float))
+                    and float(targets["max_weight"]) > 0
+                    else None
+                ),
+            )
+        finally:
+            if harvest_progress is not None:
+                harvest_progress.close()
+        sample_size = int(targets.get("sample_size", 0)) if isinstance(targets, dict) else 0
+        if sample_size >= 50 and simulation.get("status") == "ok":
+            replay_violations = []
+            path_tracking_error = _float_or_none(simulation.get("portfolio_harvest_tracking_error")) or 0.0
+            path_beta = _float_or_none(simulation.get("portfolio_harvest_beta")) or 0.0
+            if path_tracking_error > 0.025:
+                replay_violations.append(
+                    f"harvest_path_tracking_error={path_tracking_error:.4f} above 0.0250"
+                )
+            if not 0.98 <= path_beta <= 1.02:
+                replay_violations.append(f"harvest_path_beta={path_beta:.4f} outside 0.98-1.02")
+            if replay_violations:
+                raise ValueError(
+                    "harvest replay violates hard benchmark-fidelity constraints: "
+                    + "; ".join(replay_violations)
+                )
         portfolio["portfolio_harvest_simulation"] = simulation
         metrics = portfolio.setdefault("metrics", {})
         metrics["portfolio_simulated_tax_alpha"] = simulation["portfolio_simulated_tax_alpha"]
@@ -500,9 +561,20 @@ def attach_portfolio_context(portfolio, data_dir: str, prices, metadata, candida
         metrics["benchmark_annualized_return"] = simulation["benchmark_annualized_return"]
         metrics["portfolio_harvest_active_return"] = simulation["portfolio_harvest_active_return"]
         metrics["portfolio_harvest_tracking_error"] = simulation["portfolio_harvest_tracking_error"]
+        metrics["portfolio_harvest_tracking_error_annualized_pct"] = simulation[
+            "portfolio_harvest_tracking_error_annualized_pct"
+        ]
         metrics["portfolio_harvest_beta"] = simulation["portfolio_harvest_beta"]
         metrics["portfolio_harvest_correlation"] = simulation["portfolio_harvest_correlation"]
         metrics["portfolio_harvest_observations"] = simulation["portfolio_harvest_observations"]
+        metrics["realized_loss_rate_pct_per_year"] = simulation["realized_loss_rate_pct_per_year"]
+        metrics["immediate_tax_savings_pct_per_year"] = simulation["immediate_tax_savings_pct_per_year"]
+        metrics["immediate_net_tax_savings_pct_per_year"] = simulation["immediate_net_tax_savings_pct_per_year"]
+        metrics["simulated_after_tax_alpha_pct_per_year"] = simulation["simulated_after_tax_alpha_pct_per_year"]
+        metrics["full_liquidation_after_tax_alpha_pct_per_year"] = simulation[
+            "full_liquidation_after_tax_alpha_pct_per_year"
+        ]
+        metrics["terminal_after_tax_wealth_difference_pct"] = simulation["terminal_after_tax_wealth_difference_pct"]
     portfolio["source_cache"] = {
         "data_dir": str(Path(data_dir).resolve()),
         "metadata": metadata,
@@ -520,48 +592,117 @@ def write_json_with_parents(data: object, path: str | Path) -> None:
 
 def print_construct_summary(portfolio, *, sector_match: bool) -> None:
     metrics = portfolio["metrics"]
+    tracking_error_pct = float(metrics.get("tracking_error_annualized_pct", metrics.get("error_percentage", 0.0)))
+    simulated_alpha_pct = float(
+        metrics.get(
+            "simulated_after_tax_alpha_pct_per_year",
+            float(metrics["simulated_tax_alpha"]) * 100.0,
+        )
+    )
+    gross_loss_pct = float(
+        metrics.get(
+            "gross_harvestable_loss_rate_pct_per_year",
+            float(metrics["gross_harvestable_loss_rate"]) * 100.0,
+        )
+    )
     print(
-        "Portfolio beta={:.4f}, error percentage={:.2f}%, tax alpha={:.4f}, simulated tax alpha={:.4f}, gross harvestable loss rate={:.4f}".format(
+        (
+            "Portfolio beta={:.4f}, tracking_error_annualized_pct={:.2f}%, "
+            "tax_alpha_pct_per_year={:.2f}%, "
+            "simulated_after_tax_alpha_pct_per_year={:.2f}%, "
+            "gross_harvestable_loss_rate_pct_per_year={:.2f}%"
+        ).format(
             float(metrics["beta"]),
-            float(metrics.get("error_percentage", 0.0)),
-            float(metrics["tax_alpha"]),
-            float(metrics["simulated_tax_alpha"]),
-            float(metrics["gross_harvestable_loss_rate"]),
+            tracking_error_pct,
+            float(metrics["tax_alpha"]) * 100.0,
+            simulated_alpha_pct,
+            gross_loss_pct,
         )
     )
     if "tracking_error" in metrics:
+        active_share_pct = float(metrics.get("active_share_pct", float(metrics.get("active_share", 0.0)) * 100.0))
+        max_weight_pct = float(metrics.get("max_weight_pct", float(metrics.get("max_weight", 0.0)) * 100.0))
         print(
-            "Tracking error={:.4f}, active share={:.4f}, max weight={:.4f}, effective names={:.1f}".format(
-                float(metrics["tracking_error"]),
-                float(metrics.get("active_share", 0.0)),
-                float(metrics.get("max_weight", 0.0)),
+            (
+                "tracking_error_annualized_pct={:.2f}%, active_share_pct={:.2f}%, "
+                "max_weight_pct={:.2f}%, effective_names={:.1f}"
+            ).format(
+                float(metrics.get("tracking_error_annualized_pct", float(metrics["tracking_error"]) * 100.0)),
+                active_share_pct,
+                max_weight_pct,
                 float(metrics.get("effective_number_of_names", 0.0)),
             )
         )
     if "portfolio_simulated_tax_alpha" in metrics:
+        replay_alpha_pct = float(
+            metrics.get(
+                "simulated_after_tax_alpha_pct_per_year",
+                float(metrics["portfolio_simulated_tax_alpha"]) * 100.0,
+            )
+        )
+        realized_loss_pct = float(
+            metrics.get(
+                "realized_loss_rate_pct_per_year",
+                float(metrics["portfolio_realized_loss_rate"]) * 100.0,
+            )
+        )
         print(
-            "Portfolio harvest alpha={:.4f}, realized loss rate={:.4f}, harvests={}, rebalances={}".format(
-                float(metrics["portfolio_simulated_tax_alpha"]),
-                float(metrics["portfolio_realized_loss_rate"]),
+            (
+                "simulated_after_tax_alpha_pct_per_year={:.2f}%, "
+                "realized_loss_rate_pct_per_year={:.2f}%, "
+                "immediate_tax_savings_pct_per_year={:.2f}%, harvests={}, rebalances={}"
+            ).format(
+                replay_alpha_pct,
+                realized_loss_pct,
+                float(metrics.get("immediate_tax_savings_pct_per_year", 0.0)),
                 int(metrics["portfolio_harvest_count"]),
                 int(metrics.get("portfolio_rebalance_count", 0)),
             )
         )
     if "portfolio_harvest_tracking_error" in metrics:
+        harvest_tracking_error_pct = float(
+            metrics.get(
+                "portfolio_harvest_tracking_error_annualized_pct",
+                float(metrics["portfolio_harvest_tracking_error"]) * 100.0,
+            )
+        )
         print(
-            "Harvest path tracking error={:.4f}, active return={:.4f}, beta={:.4f}, correlation={:.4f}".format(
-                float(metrics["portfolio_harvest_tracking_error"]),
-                float(metrics["portfolio_harvest_active_return"]),
+            (
+                "harvest_path_tracking_error_annualized_pct={:.2f}%, "
+                "harvest_path_active_return_pct_per_year={:.2f}%, beta={:.4f}, "
+                "correlation={:.4f}"
+            ).format(
+                harvest_tracking_error_pct,
+                float(metrics["portfolio_harvest_active_return"]) * 100.0,
                 float(metrics["portfolio_harvest_beta"]),
                 float(metrics["portfolio_harvest_correlation"]),
             )
         )
     if sector_match:
-        print("Sector absolute error={:.4f}".format(float(metrics.get("sector_abs_error", 0.0))))
+        sector_error_pct = float(
+            metrics.get(
+                "sector_absolute_error_pct",
+                float(metrics.get("sector_abs_error", 0.0)) * 100.0,
+            )
+        )
+        print(
+            "sector_absolute_error_pct={:.2f}%".format(sector_error_pct)
+        )
+    warnings = metrics.get("constraint_warnings")
+    if isinstance(warnings, list) and warnings:
+        print("Constraint warnings: {}".format(", ".join(str(item) for item in warnings)))
 
 
 def command_construct(args: argparse.Namespace) -> int:
-    holdings, prices, metadata, benchmark, candidates, replacement_universe, historical_holdings = construct_context(args)
+    (
+        holdings,
+        prices,
+        metadata,
+        benchmark,
+        candidates,
+        replacement_universe,
+        historical_holdings,
+    ) = construct_context(args)
     portfolio = construct_from_args(
         args,
         holdings,
@@ -581,7 +722,15 @@ def command_construct(args: argparse.Namespace) -> int:
 
 
 def command_sector_study(args: argparse.Namespace) -> int:
-    holdings, prices, metadata, benchmark, candidates, replacement_universe, historical_holdings = construct_context(args)
+    (
+        holdings,
+        prices,
+        metadata,
+        benchmark,
+        candidates,
+        replacement_universe,
+        historical_holdings,
+    ) = construct_context(args)
     prefix = Path(args.output_prefix)
     no_sector_path = Path(f"{prefix}_no_sector.json")
     sector_path = Path(f"{prefix}_sector.json")
@@ -674,7 +823,10 @@ def print_comparison_summary(comparison) -> None:
             if not isinstance(returns, dict):
                 returns = {}
             print(
-                "{}: annualized return={}, tracking error={}, beta={}, sector active share={}, sector similarity={}, active share={}".format(
+                (
+                    "{}: annualized return={}, tracking error={}, beta={}, "
+                    "sector active share={}, sector similarity={}, active share={}"
+                ).format(
                     label,
                     format_pct(returns.get("annualized_return")),
                     format_pct(returns.get("benchmark_tracking_error")),
@@ -693,7 +845,10 @@ def print_comparison_summary(comparison) -> None:
             if not isinstance(returns, dict):
                 returns = {}
             print(
-                "{} vs {}: ticker overlap={}, weighted overlap={}, sector distance={}, return correlation={}, pair tracking error={}".format(
+                (
+                    "{} vs {}: ticker overlap={}, weighted overlap={}, "
+                    "sector distance={}, return correlation={}, pair tracking error={}"
+                ).format(
                     pair.get("left"),
                     pair.get("right"),
                     pair.get("ticker_overlap_count"),
