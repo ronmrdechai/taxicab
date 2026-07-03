@@ -275,17 +275,6 @@ def build_parser() -> argparse.ArgumentParser:
     construct = subparsers.add_parser("construct", help="Construct an optimized direct index portfolio.")
     add_construct_arguments(construct)
 
-    sector_study = subparsers.add_parser(
-        "sector-study",
-        help="Run matched construct jobs with and without sector matching, then compare them.",
-    )
-    add_construct_arguments(sector_study, include_sector_match=False, include_output=False)
-    sector_study.add_argument(
-        "--output-prefix",
-        required=True,
-        help="Output prefix. Writes *_no_sector.json, *_sector.json, and *_comparison.json.",
-    )
-
     compare = subparsers.add_parser("compare", help="Compare portfolio states against each other and the index.")
     compare.add_argument("--data-dir", required=True, help="Cache directory used to evaluate historical returns.")
     compare.add_argument(
@@ -784,69 +773,6 @@ def command_construct(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_sector_study(args: argparse.Namespace) -> int:
-    (
-        holdings,
-        prices,
-        metadata,
-        benchmark,
-        candidates,
-        replacement_universe,
-        historical_holdings,
-    ) = construct_context(args)
-    prefix = Path(args.output_prefix)
-    no_sector_path = Path(f"{prefix}_no_sector.json")
-    sector_path = Path(f"{prefix}_sector.json")
-    comparison_path = Path(f"{prefix}_comparison.json")
-
-    no_sector = construct_from_args(
-        args,
-        holdings,
-        prices,
-        metadata,
-        benchmark,
-        candidates,
-        replacement_universe,
-        historical_holdings,
-        match_sectors=False,
-        progress_label="No-sector",
-    )
-    sector = construct_from_args(
-        args,
-        holdings,
-        prices,
-        metadata,
-        benchmark,
-        candidates,
-        replacement_universe,
-        historical_holdings,
-        match_sectors=True,
-        progress_label="Sector-matched",
-    )
-    comparison = compare_portfolios(
-        {"no_sector": no_sector, "sector": sector},
-        holdings,
-        prices,
-        benchmark,
-    )
-    comparison["sources"] = {
-        "no_sector": str(no_sector_path),
-        "sector": str(sector_path),
-    }
-
-    write_json_with_parents(no_sector, no_sector_path)
-    write_json_with_parents(sector, sector_path)
-    write_json_with_parents(comparison, comparison_path)
-
-    print(f"Wrote no-sector portfolio to {no_sector_path}")
-    print_construct_summary(no_sector, sector_match=False)
-    print(f"Wrote sector-matched portfolio to {sector_path}")
-    print_construct_summary(sector, sector_match=True)
-    print(f"Wrote comparison to {comparison_path}")
-    print_comparison_summary(comparison)
-    return 0
-
-
 def command_compare(args: argparse.Namespace) -> int:
     holdings, prices, metadata = read_cache(args.data_dir)
     benchmark = str(metadata.get("index", "")).upper()
@@ -1170,8 +1096,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return command_download(args)
     if args.command == "construct":
         return command_construct(args)
-    if args.command == "sector-study":
-        return command_sector_study(args)
     if args.command == "compare":
         return command_compare(args)
     if args.command == "rebalance":

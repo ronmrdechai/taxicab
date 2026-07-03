@@ -319,53 +319,6 @@ class CliTests(unittest.TestCase):
             self.assertIn("left harvest replay:", stdout.getvalue())
             self.assertIn("left vs right harvest replay delta:", stdout.getvalue())
 
-    def test_sector_study_command_writes_both_runs_and_comparison(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            data_dir = Path(tmp) / "cache"
-            prefix = Path(tmp) / "sector_study"
-            benchmark_returns = [0.01, -0.01, 0.02, -0.02, 0.01, -0.01]
-            holdings = [
-                Holding("AAA", 0.5, "Tech"),
-                Holding("BBB", 0.5, "Health"),
-            ]
-            prices = {
-                "IDX": price_series(100.0, benchmark_returns),
-                "AAA": price_series(50.0, benchmark_returns),
-                "BBB": price_series(80.0, [item * 1.1 for item in benchmark_returns]),
-            }
-            write_cache(data_dir, holdings, prices, {"index": "IDX"})
-
-            with contextlib.redirect_stdout(io.StringIO()):
-                status = main(
-                    [
-                        "sector-study",
-                        "--data-dir",
-                        str(data_dir),
-                        "--sample-size",
-                        "2",
-                        "--error-margin",
-                        "0.05",
-                        "--target-tax-alpha",
-                        "0.03",
-                        "--rebalance-frequency",
-                        "monthly",
-                        "--min-observations",
-                        "5",
-                        "--selection-iterations",
-                        "0",
-                        "--weight-iterations",
-                        "5",
-                        "--output-prefix",
-                        str(prefix),
-                    ]
-                )
-
-            self.assertEqual(status, 0)
-            self.assertTrue(Path(f"{prefix}_no_sector.json").exists())
-            self.assertTrue(Path(f"{prefix}_sector.json").exists())
-            comparison = json.loads(Path(f"{prefix}_comparison.json").read_text(encoding="utf-8"))
-            self.assertEqual(len(comparison["pairwise"]), 1)
-
 
 if __name__ == "__main__":
     unittest.main()

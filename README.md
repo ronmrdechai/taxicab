@@ -94,24 +94,7 @@ taxicab construct \
   --output ./portfolio.json
 ```
 
-Run the same construction both with and without sector matching, then compare the runs against each other and the index baseline:
-
-```bash
-taxicab sector-study \
-  --data-dir ./cache/spy \
-  --sample-size 75 \
-  --error-margin 0.05 \
-  --target-tax-alpha 0.03 \
-  --tax-metric simulated \
-  --tax-alpha-mode at-least \
-  --rebalance-frequency quarterly \
-  --harvest-frequency daily \
-  --max-weight 0.08 \
-  --progress \
-  --output-prefix ./runs/spy_sector_study
-```
-
-Compare any existing portfolio states:
+Compare existing portfolio states, including separate construction runs with and without `--sector-match`, against each other and the index baseline:
 
 ```bash
 taxicab compare \
