@@ -217,6 +217,7 @@ def portfolio_summary(
     benchmark_values = [benchmark_returns[day] for day in common_dates]
     return_metrics = return_summary(common_dates, portfolio_values, benchmark_values)
 
+    feature_summary = portfolio_feature_summary(portfolio, weights, sectors, target_sectors, return_metrics)
     return {
         "position_count": len(weights),
         "covered_price_weight": returns.covered_weight,
@@ -231,6 +232,8 @@ def portfolio_summary(
         "sector_overlap_to_index": weighted_overlap(sectors, target_sectors),
         "effective_sector_count": effective_count(sectors.values()),
         "returns": return_metrics,
+        "features": feature_summary,
+        "objective_decomposition": objective_decomposition(portfolio, feature_summary),
     }
 
 
@@ -255,10 +258,13 @@ def pairwise_summary(
     union = left_tickers.union(right_tickers)
     jaccard = len(left_tickers.intersection(right_tickers)) / len(union) if union else 1.0
 
+    left_factors = factor_exposures(left, left_values)
+    right_factors = factor_exposures(right, right_values)
     return {
         "left": left_label,
         "right": right_label,
         "ticker_overlap_count": len(left_tickers.intersection(right_tickers)),
+        "weight_cosine_similarity": cosine_similarity(left_weights, right_weights),
         "ticker_jaccard": jaccard,
         "weighted_overlap": weighted_overlap(left_weights, right_weights),
         "active_share": active_share(left_weights, right_weights),
@@ -266,9 +272,139 @@ def pairwise_summary(
         "sector_active_share": 0.5 * l1_distance(left_sectors, right_sectors),
         "sector_similarity": cosine_similarity(left_sectors, right_sectors),
         "sector_overlap": weighted_overlap(left_sectors, right_sectors),
+        "factor_abs_distance": l1_distance(left_factors, right_factors),
+        "tax_lot_action_overlap": tax_lot_action_overlap(left, right),
         "returns": pair_return_summary(common_dates, left_values, right_values),
     }
 
+
+
+def portfolio_feature_summary(
+    portfolio: Mapping[str, object],
+    weights: Mapping[str, float],
+    sectors: Mapping[str, float],
+    target_sectors: Mapping[str, float],
+    return_metrics: Mapping[str, object],
+) -> Dict[str, object]:
+    metrics = _mapping(portfolio.get("metrics"))
+    targets = _mapping(portfolio.get("targets"))
+    replay = _mapping(portfolio.get("portfolio_harvest_simulation"))
+    features: Dict[str, object] = {
+        "tracking_error": _float_or_none(metrics.get("tracking_error"))
+        or _float_or_none(return_metrics.get("benchmark_tracking_error"))
+        or 0.0,
+        "beta": _float_or_none(metrics.get("beta")) or _float_or_none(return_metrics.get("benchmark_beta")) or 0.0,
+        "tax_alpha": _float_or_none(metrics.get("tax_alpha")) or 0.0,
+        "simulated_tax_alpha": _float_or_none(metrics.get("portfolio_simulated_tax_alpha"))
+        or _float_or_none(metrics.get("simulated_tax_alpha"))
+        or 0.0,
+        "realized_loss_rate": _float_or_none(metrics.get("portfolio_realized_loss_rate"))
+        or _float_or_none(replay.get("portfolio_realized_loss_rate"))
+        or 0.0,
+        "turnover": _float_or_none(replay.get("total_transaction_cost"))
+        or _float_or_none(metrics.get("total_transaction_cost"))
+        or 0.0,
+        "effective_names": effective_count(weights.values()),
+        "max_weight": max(weights.values()) if weights else 0.0,
+        "active_share_to_index": _float_or_none(metrics.get("active_share")) or 0.0,
+        "sector_abs_error": l1_distance(sectors, target_sectors),
+        "tracking_constraint_slack": max(
+            (_float_or_none(targets.get("error_margin")) or 0.0)
+            - (
+                _float_or_none(metrics.get("tracking_error"))
+                or _float_or_none(return_metrics.get("benchmark_tracking_error"))
+                or 0.0
+            ),
+            0.0,
+        ),
+    }
+    for sector, target in target_sectors.items():
+        features[f"sector_drift:{sector}"] = sectors.get(sector, 0.0) - target
+    features.update({f"factor:{key}": value for key, value in factor_exposures(portfolio, []).items()})
+    return features
+
+
+def factor_exposures(portfolio: Mapping[str, object], returns: Sequence[float]) -> Dict[str, float]:
+    metrics = _mapping(portfolio.get("metrics"))
+    explicit = _mapping(metrics.get("factor_exposures")) or _mapping(portfolio.get("factor_exposures"))
+    if explicit:
+        return {str(key): value for key, raw in explicit.items() if (value := _float_or_none(raw)) is not None}
+    exposures = {}
+    for source_key, factor_key in (
+        ("beta", "beta"),
+        ("portfolio_harvest_beta", "harvest_beta"),
+        ("tracking_error", "tracking_error"),
+        ("portfolio_harvest_tracking_error", "harvest_tracking_error"),
+        ("effective_number_of_names", "effective_names"),
+    ):
+        value = _float_or_none(metrics.get(source_key))
+        if value is not None:
+            exposures[factor_key] = value
+    if returns:
+        exposures["volatility"] = annualized_std(returns)
+    return exposures
+
+
+def tax_lot_action_overlap(left: Mapping[str, object], right: Mapping[str, object]) -> float | None:
+    left_actions = tax_lot_action_tickers(left)
+    right_actions = tax_lot_action_tickers(right)
+    if not left_actions and not right_actions:
+        return None
+    union = left_actions.union(right_actions)
+    return len(left_actions.intersection(right_actions)) / len(union) if union else None
+
+
+def tax_lot_action_tickers(portfolio: Mapping[str, object]) -> set[str]:
+    replay = _mapping(portfolio.get("portfolio_harvest_simulation"))
+    tickers: set[str] = set()
+    for key in ("harvests", "actions", "tax_lot_actions"):
+        rows = replay.get(key)
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            for field in ("ticker", "sold_ticker", "harvested_ticker", "replacement_ticker"):
+                raw = cast(Mapping[str, object], row).get(field)
+                if raw:
+                    tickers.add(str(raw).upper())
+    return tickers
+
+
+def objective_decomposition(portfolio: Mapping[str, object], features: Mapping[str, object]) -> Dict[str, float]:
+    replay = _mapping(portfolio.get("portfolio_harvest_simulation"))
+    targets = _mapping(portfolio.get("targets"))
+    target_tax = (
+        _float_or_none(targets.get("estimated_tax_loss_alpha"))
+        or _float_or_none(targets.get("target_tax_alpha"))
+        or 0.0
+    )
+    tax_alpha = _float_or_none(features.get("tax_alpha")) or 0.0
+    tax_delta = tax_alpha - target_tax
+    if targets.get("tax_alpha_mode") == "at-least":
+        tax_delta = min(tax_delta, 0.0)
+    error_margin = max(_float_or_none(targets.get("error_margin")) or 0.005, 0.005)
+    tracking = _float_or_none(features.get("tracking_error")) or 0.0
+    sector = _float_or_none(features.get("sector_abs_error")) or 0.0
+    max_weight = _float_or_none(features.get("max_weight")) or 0.0
+    cash = abs(1.0 - sum(position_weights(portfolio).values()))
+    return {
+        "tracking_error_penalty": tracking / error_margin if error_margin else 0.0,
+        "sector_penalty": sector,
+        "factor_penalty": abs((_float_or_none(features.get("beta")) or 1.0) - 1.0),
+        "concentration_penalty": max_weight,
+        "transaction_cost": _float_or_none(replay.get("total_transaction_cost")) or 0.0,
+        "tax_benefit": -abs(tax_delta),
+        "wash_sale_penalty": float(_float_or_none(replay.get("skipped_constraint_violation")) or 0.0)
+        + float(_float_or_none(replay.get("skipped_no_replacement")) or 0.0),
+        "cash_penalty": cash,
+    }
+
+
+def _mapping(value: object) -> Mapping[str, object]:
+    if isinstance(value, Mapping):
+        return cast(Mapping[str, object], value)
+    return {}
 
 def position_weights(portfolio: Mapping[str, object]) -> Dict[str, float]:
     positions = portfolio.get("positions", [])
