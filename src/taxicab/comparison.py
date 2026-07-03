@@ -25,6 +25,7 @@ def compare_portfolios(
     holdings: Sequence[Holding],
     prices: Mapping[str, Sequence[PricePoint]],
     benchmark_ticker: str,
+    harvest_replays: Mapping[str, Mapping[str, object]] | None = None,
 ) -> Dict[str, object]:
     benchmark = benchmark_ticker.upper()
     if benchmark not in prices:
@@ -48,21 +49,29 @@ def compare_portfolios(
             index_weights,
             target_sectors,
         )
+        if harvest_replays and label in harvest_replays:
+            summaries[label]["harvest_replay"] = harvest_replay_summary(harvest_replays[label])
 
     labels = list(portfolios)
     pairs = []
     for idx, left in enumerate(labels):
         for right in labels[idx + 1 :]:
-            pairs.append(
-                pairwise_summary(
+            pair_summary = pairwise_summary(
+                left,
+                right,
+                portfolios[left],
+                portfolios[right],
+                portfolio_returns[left].values,
+                portfolio_returns[right].values,
+            )
+            if harvest_replays and left in harvest_replays and right in harvest_replays:
+                pair_summary["harvest_replay_deltas"] = pairwise_harvest_replay_summary(
                     left,
                     right,
-                    portfolios[left],
-                    portfolios[right],
-                    portfolio_returns[left].values,
-                    portfolio_returns[right].values,
+                    harvest_replays[left],
+                    harvest_replays[right],
                 )
-            )
+            pairs.append(pair_summary)
 
     return {
         "version": 1,
@@ -72,6 +81,96 @@ def compare_portfolios(
         "index_sector_targets": target_sectors,
         "portfolios": summaries,
         "pairwise": pairs,
+    }
+
+
+def harvest_replay_summary(replay: Mapping[str, object]) -> Dict[str, object]:
+    summary_keys = [
+        "status",
+        "reason",
+        "start",
+        "end",
+        "years",
+        "rebalance_frequency",
+        "harvest_frequency",
+        "portfolio_harvest_annualized_return",
+        "benchmark_annualized_return",
+        "portfolio_harvest_active_return",
+        "portfolio_harvest_tracking_error",
+        "portfolio_harvest_tracking_error_annualized_pct",
+        "portfolio_harvest_beta",
+        "portfolio_harvest_correlation",
+        "portfolio_harvest_observations",
+        "portfolio_simulated_tax_alpha",
+        "portfolio_realized_loss_rate",
+        "annual_realized_loss",
+        "total_realized_loss",
+        "total_tax_benefit",
+        "total_transaction_cost",
+        "total_replacement_cost",
+        "total_net_tax_benefit",
+        "realized_loss_rate_pct_per_year",
+        "immediate_tax_savings_pct_per_year",
+        "immediate_net_tax_savings_pct_per_year",
+        "simulated_after_tax_alpha_pct_per_year",
+        "terminal_after_tax_wealth_difference_pct",
+        "harvest_count",
+        "rebalance_count",
+        "skipped_no_replacement",
+        "skipped_nonpositive_net_benefit",
+        "skipped_constraint_violation",
+        "skipped_harvests_by_reason",
+        "selected_position_count",
+        "missing_position_tickers",
+    ]
+    summary = {key: replay[key] for key in summary_keys if key in replay}
+    terminal_pct = _float_or_none(replay.get("terminal_after_tax_wealth_difference_pct"))
+    if terminal_pct is not None:
+        summary["terminal_after_tax_wealth_difference"] = terminal_pct / 100.0
+    return summary
+
+
+def pairwise_harvest_replay_summary(
+    left_label: str,
+    right_label: str,
+    left: Mapping[str, object],
+    right: Mapping[str, object],
+) -> Dict[str, object]:
+    delta_keys = [
+        "portfolio_harvest_annualized_return",
+        "benchmark_annualized_return",
+        "portfolio_harvest_active_return",
+        "portfolio_harvest_tracking_error",
+        "portfolio_harvest_beta",
+        "portfolio_harvest_correlation",
+        "portfolio_simulated_tax_alpha",
+        "portfolio_realized_loss_rate",
+        "annual_realized_loss",
+        "total_realized_loss",
+        "total_tax_benefit",
+        "total_transaction_cost",
+        "total_replacement_cost",
+        "total_net_tax_benefit",
+        "harvest_count",
+        "rebalance_count",
+    ]
+    deltas = {}
+    for key in delta_keys:
+        left_value = _float_or_none(left.get(key))
+        right_value = _float_or_none(right.get(key))
+        if left_value is not None and right_value is not None:
+            deltas[key] = left_value - right_value
+    left_terminal = _float_or_none(left.get("terminal_after_tax_wealth_difference_pct"))
+    right_terminal = _float_or_none(right.get("terminal_after_tax_wealth_difference_pct"))
+    if left_terminal is not None and right_terminal is not None:
+        deltas["terminal_after_tax_wealth_difference"] = (left_terminal - right_terminal) / 100.0
+        deltas["terminal_after_tax_wealth_difference_pct"] = left_terminal - right_terminal
+    return {
+        "left": left_label,
+        "right": right_label,
+        "left_status": left.get("status"),
+        "right_status": right.get("status"),
+        "left_minus_right": deltas,
     }
 
 
@@ -362,6 +461,15 @@ def _float_value(value: object) -> float:
     if isinstance(value, (int, float, str)):
         return float(value)
     raise TypeError(f"expected a numeric value, got {type(value).__name__}")
+
+
+def _float_or_none(value: object) -> float | None:
+    if not isinstance(value, (int, float, str)):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def parse_labeled_path(value: str) -> Tuple[str, Path]:

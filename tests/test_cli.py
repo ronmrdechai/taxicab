@@ -126,6 +126,90 @@ class CliTests(unittest.TestCase):
                 0.5,
             )
 
+    def test_compare_command_can_replay_harvest_performance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "cache"
+            left = Path(tmp) / "left.json"
+            right = Path(tmp) / "right.json"
+            output = Path(tmp) / "comparison.json"
+            prices = {
+                "IDX": price_series(100.0, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+                "AAA": price_series(100.0, [-0.10, 0.00, 0.02, 0.00, 0.00, 0.00]),
+                "BBB": price_series(100.0, [0.00, 0.00, 0.00, 0.00, 0.00, 0.00]),
+                "CCC": price_series(100.0, [0.00, 0.00, 0.00, 0.00, 0.00, 0.00]),
+            }
+            holdings = [
+                Holding("AAA", 1.0 / 3.0, "Tech"),
+                Holding("BBB", 1.0 / 3.0, "Tech"),
+                Holding("CCC", 1.0 / 3.0, "Tech"),
+            ]
+            write_cache(data_dir, holdings, prices, {"index": "IDX"})
+            targets = {
+                "error_margin": 0.05,
+                "estimated_tax_loss_alpha": 0.01,
+                "tax_alpha_mode": "at-least",
+                "tax_metric": "simulated",
+                "rebalance_frequency": "monthly",
+                "harvest_frequency": "daily",
+                "tax_assumptions": {
+                    "tax_rate": 0.30,
+                    "harvest_threshold_pct": 0.05,
+                    "transaction_cost_bps": 0.0,
+                    "replacement_cost_bps": 0.0,
+                    "replacement_count": 1,
+                    "wash_sale_days": 31,
+                },
+            }
+            left.write_text(
+                json.dumps(
+                    {
+                        "targets": targets,
+                        "positions": [{"ticker": "AAA", "weight": 1.0, "sector": "Tech"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            right.write_text(
+                json.dumps(
+                    {
+                        "targets": targets,
+                        "positions": [{"ticker": "BBB", "weight": 1.0, "sector": "Tech"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                status = main(
+                    [
+                        "compare",
+                        "--data-dir",
+                        str(data_dir),
+                        "--portfolio",
+                        f"left={left}",
+                        "--portfolio",
+                        f"right={right}",
+                        "--replay-harvests",
+                        "--output",
+                        str(output),
+                    ]
+                )
+
+            self.assertEqual(status, 0)
+            comparison = json.loads(output.read_text(encoding="utf-8"))
+            left_replay = comparison["portfolios"]["left"]["harvest_replay"]
+            right_replay = comparison["portfolios"]["right"]["harvest_replay"]
+            replay_deltas = comparison["pairwise"][0]["harvest_replay_deltas"]["left_minus_right"]
+            self.assertTrue(comparison["harvest_replay"]["enabled"])
+            self.assertEqual(left_replay["status"], "ok")
+            self.assertEqual(left_replay["selected_position_count"], 1)
+            self.assertEqual(left_replay["missing_position_tickers"], [])
+            self.assertGreater(left_replay["harvest_count"], right_replay["harvest_count"])
+            self.assertGreater(replay_deltas["harvest_count"], 0)
+            self.assertIn("left harvest replay:", stdout.getvalue())
+            self.assertIn("left vs right harvest replay delta:", stdout.getvalue())
+
     def test_sector_study_command_writes_both_runs_and_comparison(self):
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "cache"

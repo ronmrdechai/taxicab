@@ -252,6 +252,11 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Portfolio JSON path, or label=path. Repeat to compare multiple portfolios.",
     )
+    compare.add_argument(
+        "--replay-harvests",
+        action="store_true",
+        help="Replay each portfolio's harvest/rebalance simulation before comparing performance and tax metrics.",
+    )
     compare.add_argument("--output", help="Comparison JSON to write. Defaults to stdout summary only.")
 
     rebalance = subparsers.add_parser("rebalance", help="Emit buy/sell suggestions from current holdings.")
@@ -802,13 +807,168 @@ def command_compare(args: argparse.Namespace) -> int:
         portfolios[label] = cast(Dict[str, object], state)
         sources[label] = str(path)
 
-    comparison = compare_portfolios(portfolios, holdings, prices, benchmark)
+    harvest_replays = None
+    if args.replay_harvests:
+        historical_holdings = read_historical_holdings_cache(args.data_dir)
+        harvest_replays = compare_harvest_replays(
+            portfolios,
+            holdings,
+            prices,
+            benchmark,
+            historical_holdings,
+        )
+
+    comparison = compare_portfolios(
+        portfolios,
+        holdings,
+        prices,
+        benchmark,
+        harvest_replays=harvest_replays,
+    )
     comparison["sources"] = sources
+    if args.replay_harvests:
+        comparison["harvest_replay"] = {"enabled": True}
     if args.output:
         write_json_with_parents(comparison, args.output)
         print(f"Wrote comparison to {args.output}")
     print_comparison_summary(comparison)
     return 0
+
+
+def compare_harvest_replays(
+    portfolios: Mapping[str, Mapping[str, object]],
+    holdings,
+    prices,
+    benchmark: str,
+    historical_holdings,
+) -> Dict[str, Mapping[str, object]]:
+    if benchmark not in prices:
+        raise ValueError(f"benchmark prices missing for {benchmark}")
+    universe_holdings = holdings_universe(holdings, historical_holdings)
+    benchmark_returns = daily_returns(prices[benchmark])
+    candidate_cache = {}
+    replays: Dict[str, Mapping[str, object]] = {}
+
+    for label, portfolio in portfolios.items():
+        targets = _mapping_or_empty(portfolio.get("targets"))
+        tax_assumptions = _mapping_or_empty(targets.get("tax_assumptions"))
+        rebalance_frequency = str(targets.get("rebalance_frequency", "quarterly"))
+        harvest_frequency = str(targets.get("harvest_frequency", rebalance_frequency))
+        tax_metric = str(targets.get("tax_metric", "simulated"))
+        if tax_metric not in {"simulated", "gross"}:
+            tax_metric = "simulated"
+        tax_rate = _float_default(tax_assumptions.get("tax_rate"), 0.30)
+        harvest_threshold_pct = _float_default(tax_assumptions.get("harvest_threshold_pct"), 0.05)
+        transaction_cost_bps = _float_default(tax_assumptions.get("transaction_cost_bps"), 5.0)
+        replacement_cost_bps = _float_default(tax_assumptions.get("replacement_cost_bps"), 10.0)
+        replacement_count = _int_default(tax_assumptions.get("replacement_count"), 2)
+        wash_sale_days = _int_default(tax_assumptions.get("wash_sale_days"), 31)
+        min_observations = _int_default(targets.get("min_observations"), 2)
+        min_observations = max(min_observations, 2)
+        cache_key = (
+            rebalance_frequency,
+            harvest_frequency,
+            tax_metric,
+            tax_rate,
+            harvest_threshold_pct,
+            transaction_cost_bps,
+            replacement_cost_bps,
+            min_observations,
+        )
+        if cache_key not in candidate_cache:
+            candidate_cache[cache_key] = build_candidates(
+                universe_holdings,
+                prices,
+                benchmark,
+                rebalance_frequency,
+                min_observations=min_observations,
+                tax_metric=tax_metric,
+                tax_rate=tax_rate,
+                harvest_threshold_pct=harvest_threshold_pct,
+                transaction_cost_bps=transaction_cost_bps,
+                replacement_cost_bps=replacement_cost_bps,
+                harvest_frequency=harvest_frequency,
+            )
+        candidates = candidate_cache[cache_key]
+        candidate_by_ticker = {candidate.ticker: candidate for candidate in candidates}
+        selected = []
+        weights = []
+        missing_tickers = []
+        for position in _portfolio_position_rows(portfolio):
+            ticker = str(position.get("ticker", "")).upper()
+            weight = _float_default(position.get("weight"), 0.0)
+            candidate = candidate_by_ticker.get(ticker)
+            if candidate is None:
+                missing_tickers.append(ticker)
+                continue
+            selected.append(candidate)
+            weights.append(weight)
+
+        simulation = dict(
+            simulate_portfolio_harvests(
+                selected,
+                weights,
+                candidates,
+                prices,
+                benchmark,
+                benchmark_returns,
+                rebalance_frequency,
+                _float_default(targets.get("error_margin"), 0.05),
+                _float_default(
+                    targets.get("estimated_tax_loss_alpha", targets.get("target_tax_alpha")),
+                    0.0,
+                ),
+                tax_alpha_mode=str(targets.get("tax_alpha_mode", "closest")),
+                tax_rate=tax_rate,
+                harvest_threshold_pct=harvest_threshold_pct,
+                transaction_cost_bps=transaction_cost_bps,
+                replacement_cost_bps=replacement_cost_bps,
+                replacement_count=replacement_count,
+                wash_sale_days=wash_sale_days,
+                historical_holdings=historical_holdings or None,
+                harvest_frequency=harvest_frequency,
+                max_weight_limit=_positive_float_or_none(targets.get("max_weight")),
+            )
+        )
+        simulation["selected_position_count"] = len(selected)
+        simulation["missing_position_tickers"] = sorted(set(missing_tickers))
+        replays[label] = simulation
+
+    return replays
+
+
+def _mapping_or_empty(value: object) -> Mapping[str, object]:
+    if isinstance(value, dict):
+        return cast(Mapping[str, object], value)
+    return {}
+
+
+def _portfolio_position_rows(portfolio: Mapping[str, object]) -> List[Mapping[str, object]]:
+    positions = portfolio.get("positions", [])
+    if not isinstance(positions, list):
+        raise ValueError("portfolio positions must be a list")
+    rows: List[Mapping[str, object]] = []
+    for item in positions:
+        if isinstance(item, dict):
+            rows.append(cast(Mapping[str, object], item))
+    return rows
+
+
+def _float_default(value: object, default: float) -> float:
+    number = _float_or_none(value)
+    return number if number is not None else default
+
+
+def _int_default(value: object, default: int) -> int:
+    number = _float_or_none(value)
+    return int(number) if number is not None else default
+
+
+def _positive_float_or_none(value: object) -> Optional[float]:
+    number = _float_or_none(value)
+    if number is None or number <= 0:
+        return None
+    return number
 
 
 def print_comparison_summary(comparison) -> None:
@@ -836,6 +996,22 @@ def print_comparison_summary(comparison) -> None:
                     format_pct(summary.get("active_share_to_index")),
                 )
             )
+            replay = summary.get("harvest_replay")
+            if isinstance(replay, dict):
+                print(
+                    (
+                        "{} harvest replay: simulated tax alpha={}, realized loss={}, "
+                        "active return={}, tracking error={}, harvests={}, rebalances={}"
+                    ).format(
+                        label,
+                        format_pct(replay.get("portfolio_simulated_tax_alpha")),
+                        format_pct(replay.get("portfolio_realized_loss_rate")),
+                        format_pct(replay.get("portfolio_harvest_active_return")),
+                        format_pct(replay.get("portfolio_harvest_tracking_error")),
+                        replay.get("harvest_count", "n/a"),
+                        replay.get("rebalance_count", "n/a"),
+                    )
+                )
     pairs = comparison.get("pairwise", [])
     if isinstance(pairs, list):
         for pair in pairs:
@@ -858,6 +1034,23 @@ def print_comparison_summary(comparison) -> None:
                     format_pct(returns.get("tracking_error")),
                 )
             )
+            replay = pair.get("harvest_replay_deltas")
+            if isinstance(replay, dict):
+                deltas = replay.get("left_minus_right", {})
+                if isinstance(deltas, dict):
+                    print(
+                        (
+                            "{} vs {} harvest replay delta: simulated tax alpha={}, "
+                            "realized loss={}, active return={}, terminal after-tax wealth={}"
+                        ).format(
+                            pair.get("left"),
+                            pair.get("right"),
+                            format_pct(deltas.get("portfolio_simulated_tax_alpha")),
+                            format_pct(deltas.get("portfolio_realized_loss_rate")),
+                            format_pct(deltas.get("portfolio_harvest_active_return")),
+                            format_pct(deltas.get("terminal_after_tax_wealth_difference")),
+                        )
+                    )
 
 
 def format_pct(value: object) -> str:
