@@ -21,6 +21,41 @@ UV_CACHE_DIR=.uv-cache PYTHONPATH=src uv run --with numpy --with scipy --with tq
 
 NumPy, SciPy, and PySCIPOpt are required dependencies. NumPy is used for tracking-error covariance math, SciPy is used for constrained continuous weight optimization, and PySCIPOpt is used for optional MIQP selection.
 
+## Quick Start
+
+The commands below run Taxicab from a fresh checkout without installing it into your Python environment. They use `uv` to create an isolated runtime and keep dependency caches inside the repository working tree.
+
+1. Confirm the CLI starts:
+
+   ```bash
+   UV_CACHE_DIR=.uv-cache PYTHONPATH=src uv run --with numpy --with scipy --with tqdm --with PySCIPOpt --no-project python -m taxicab.cli --help
+   ```
+
+2. Download an offline data cache from a holdings export. Replace `./spy_holdings.csv` with your own issuer-provided CSV/XLSX holdings file if you do not want to use SPY data:
+
+   ```bash
+   taxicab download \
+     --index SPY \
+     --holdings-csv ./spy_holdings.csv \
+     --data-dir ./cache/spy \
+     --years 5 \
+     --price-field close
+   ```
+
+3. Construct a sample portfolio from that cache:
+
+   ```bash
+   taxicab construct \
+     --data-dir ./cache/spy \
+     --sample-size 50 \
+     --error-margin 0.05 \
+     --target-tax-alpha 0.02 \
+     --tax-metric simulated \
+     --output ./portfolio.json
+   ```
+
+Generated caches, portfolio files, run outputs, and order CSVs are local user data and are ignored by default. Review any generated output before acting on it; Taxicab does not provide tax or investment advice and does not place trades.
+
 ## Data Model
 
 The cache is built from:
@@ -171,3 +206,9 @@ The script runs `ruff check .`, `ty check .`, and the unit tests through `uv`.
 ```bash
 UV_CACHE_DIR=.uv-cache PYTHONPATH=src uv run --with numpy --with scipy --with tqdm --with PySCIPOpt --no-project python -m unittest discover -s tests
 ```
+
+## License
+
+Taxicab is licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE) for the full license text.
+
+Per-file source headers are not required for this project because the repository-level `LICENSE` file and package metadata identify the license for the work. Add a header only when a file needs distinct copyright, attribution, or third-party license notices.
