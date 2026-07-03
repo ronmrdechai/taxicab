@@ -74,6 +74,8 @@ Holdings CSV columns are intentionally flexible. The loader recognizes common na
 
 Weights can be percentages (`6.2`) or decimals (`0.062`).
 
+Construction writes the human-readable portfolio/run state as JSON. It also writes a sibling `*.tracking-model.npz` artifact for the selected portfolio's rehydratable tracking model. The JSON records the artifact filename and ticker order, while the binary NumPy artifact stores the covariance matrix and benchmark covariance vector without expanding large numeric arrays into JSON.
+
 For ETFs, use the issuer's holdings export as `--holdings-csv`, `--holdings-url`, `--holdings-xlsx`, or `--holdings-xlsx-url`. For abstract indexes, provide your own holdings file. This keeps the optimizer deterministic and avoids relying on one brittle ETF holdings endpoint.
 
 For survivorship-bias-aware backtests, provide point-in-time snapshots with `--historical-holdings-csv`. The CSV needs a snapshot date column (`date`, `as_of`, or `snapshot_date`) plus ticker/weight/sector/industry columns. Taxicab uses the latest snapshot as the current construction universe, uses all historical snapshot tickers as the replacement universe, and restricts harvest replacements to names active in the latest snapshot on or before each simulated date. To include delisted names, also provide their historical prices in a local `--prices-csv` with `date`, `ticker`, and `adj_close`/`close` columns; public quote APIs often cannot recover delisted histories reliably.

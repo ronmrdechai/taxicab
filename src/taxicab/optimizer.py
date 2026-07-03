@@ -6,6 +6,7 @@ import importlib
 import random
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 import numpy as np
@@ -50,6 +51,52 @@ class TrackingModel:
     benchmark_variance: float
     observations: int
     annualization: float = 252.0
+
+
+def save_tracking_model_artifact(
+    model: TrackingModel,
+    tickers: Sequence[str],
+    path: str | Path,
+) -> None:
+    """Persist a tracking model in a compact NumPy-native artifact."""
+    target = Path(path)
+    if target.parent != Path("."):
+        target.parent.mkdir(parents=True, exist_ok=True)
+    if model.covariance_matrix.shape != (len(tickers), len(tickers)):
+        raise ValueError("ticker count must match covariance matrix dimensions")
+    if model.asset_benchmark_covariance.shape != (len(tickers),):
+        raise ValueError("ticker count must match benchmark covariance vector")
+    np.savez_compressed(
+        target,
+        schema_version=np.asarray(1, dtype=np.int64),
+        tickers=np.asarray(list(tickers), dtype=np.str_),
+        covariance_matrix=np.asarray(model.covariance_matrix, dtype=float),
+        asset_benchmark_covariance=np.asarray(model.asset_benchmark_covariance, dtype=float),
+        benchmark_variance=np.asarray(model.benchmark_variance, dtype=float),
+        observations=np.asarray(model.observations, dtype=np.int64),
+        annualization=np.asarray(model.annualization, dtype=float),
+    )
+
+
+def load_tracking_model_artifact(path: str | Path) -> Tuple[List[str], TrackingModel]:
+    """Load a tracking model saved by save_tracking_model_artifact."""
+    with np.load(Path(path), allow_pickle=False) as payload:
+        schema_version = int(payload["schema_version"].item())
+        if schema_version != 1:
+            raise ValueError(f"unsupported tracking model artifact version: {schema_version}")
+        tickers = [str(item) for item in payload["tickers"].tolist()]
+        model = TrackingModel(
+            covariance_matrix=np.asarray(payload["covariance_matrix"], dtype=float),
+            asset_benchmark_covariance=np.asarray(payload["asset_benchmark_covariance"], dtype=float),
+            benchmark_variance=float(payload["benchmark_variance"].item()),
+            observations=int(payload["observations"].item()),
+            annualization=float(payload["annualization"].item()),
+        )
+    if model.covariance_matrix.shape != (len(tickers), len(tickers)):
+        raise ValueError("tracking model covariance matrix does not match ticker count")
+    if model.asset_benchmark_covariance.shape != (len(tickers),):
+        raise ValueError("tracking model benchmark covariance vector does not match ticker count")
+    return tickers, model
 
 
 @dataclass(frozen=True)
