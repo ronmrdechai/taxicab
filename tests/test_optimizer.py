@@ -2,6 +2,8 @@ import importlib.util
 import unittest
 
 from datetime import date, timedelta
+import tempfile
+from pathlib import Path
 from typing import Dict, List, cast
 
 import numpy as np
@@ -15,12 +17,14 @@ from taxicab.optimizer import (
     index_weighted_weights,
     miqp_selection,
     optimize_weights,
+    load_tracking_model_artifact,
     prepare_tracking_model,
     project_to_bounded_simplex,
     project_to_simplex,
     project_to_simplex_with_floor,
     replacement_candidates,
     simulate_portfolio_harvests,
+    save_tracking_model_artifact,
     tracking_error,
 )
 
@@ -90,6 +94,25 @@ class OptimizerTests(unittest.TestCase):
         assert model is not None
         self.assertIsInstance(model.covariance_matrix, np.ndarray)
         self.assertAlmostEqual(tracking_error([1.0], model), 0.0, places=9)
+
+    def test_tracking_model_artifact_round_trips_numpy_arrays(self):
+        benchmark_returns = returns([0.01, -0.02, 0.03])
+        candidates = [
+            Candidate("A", 1.0, "Tech", beta=1.0, tax_alpha=0.0, returns=benchmark_returns)
+        ]
+        model = prepare_tracking_model(candidates, benchmark_returns)
+        assert model is not None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "tracking-model.npz"
+            save_tracking_model_artifact(model, ["A"], artifact)
+            tickers, loaded = load_tracking_model_artifact(artifact)
+
+        self.assertEqual(tickers, ["A"])
+        np.testing.assert_allclose(loaded.covariance_matrix, model.covariance_matrix)
+        np.testing.assert_allclose(loaded.asset_benchmark_covariance, model.asset_benchmark_covariance)
+        self.assertEqual(loaded.observations, model.observations)
+        self.assertAlmostEqual(tracking_error([1.0], loaded), 0.0, places=9)
 
     def test_benchmark_proxy_returns_use_index_weights(self):
         left_returns = returns([0.01, -0.02, 0.03])

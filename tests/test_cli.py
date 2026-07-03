@@ -8,6 +8,7 @@ from pathlib import Path
 
 from taxicab.cli import main
 from taxicab.data import Holding, PricePoint, write_cache
+from taxicab.optimizer import load_tracking_model_artifact
 
 
 def price_series(start, returns):
@@ -75,6 +76,12 @@ class CliTests(unittest.TestCase):
             self.assertIn("tracking_error_annualized_pct=", stdout.getvalue())
             self.assertIn("error_percentage", state["metrics"])
             self.assertIn("tracking_error_annualized_pct", state["metrics"])
+            artifact_info = state["tracking_model_artifact"]
+            artifact_path = output.parent / artifact_info["path"]
+            self.assertTrue(artifact_path.exists())
+            tickers, model = load_tracking_model_artifact(artifact_path)
+            self.assertEqual(tickers, artifact_info["ticker_order"])
+            self.assertEqual(model.observations, artifact_info["observations"])
 
     def test_construct_command_accepts_baseline_strategy_flags(self):
         with tempfile.TemporaryDirectory() as tmp:

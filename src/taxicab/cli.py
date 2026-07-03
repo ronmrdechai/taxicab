@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 import sys
 from typing import Dict, List, Mapping, Optional, Sequence, cast
@@ -29,7 +29,13 @@ from .data import (
     write_json,
 )
 from .metrics import FREQUENCIES, daily_returns
-from .optimizer import build_candidates, construct_portfolio, simulate_portfolio_harvests
+from .optimizer import (
+    build_candidates,
+    construct_portfolio,
+    prepare_tracking_model,
+    save_tracking_model_artifact,
+    simulate_portfolio_harvests,
+)
 from .report import write_comparison_html_report
 from .rebalance import plan_rebalance, read_current_positions, write_operations_csv
 
@@ -635,6 +641,43 @@ def attach_portfolio_context(
     }
 
 
+def attach_tracking_model_artifact(
+    portfolio: Dict[str, object],
+    output_path: str | Path,
+    candidates,
+    benchmark_returns: Mapping[date, float],
+) -> None:
+    positions = portfolio.get("positions", [])
+    if not isinstance(positions, list):
+        return
+    candidate_by_ticker = {candidate.ticker: candidate for candidate in candidates}
+    selected = []
+    tickers = []
+    for position in positions:
+        if not isinstance(position, dict):
+            continue
+        ticker = str(position.get("ticker", "")).upper()
+        candidate = candidate_by_ticker.get(ticker)
+        if candidate is None:
+            continue
+        selected.append(candidate)
+        tickers.append(ticker)
+    tracking_model = prepare_tracking_model(selected, benchmark_returns)
+    if tracking_model is None:
+        return
+    output = Path(output_path)
+    artifact = output.with_suffix(output.suffix + ".tracking-model.npz")
+    save_tracking_model_artifact(tracking_model, tickers, artifact)
+    portfolio["tracking_model_artifact"] = {
+        "format": "numpy_npz",
+        "schema_version": 1,
+        "path": artifact.name,
+        "ticker_order": tickers,
+        "observations": tracking_model.observations,
+        "annualization": tracking_model.annualization,
+    }
+
+
 def write_json_with_parents(data: object, path: str | Path) -> None:
     target = Path(path)
     if target.parent != Path("."):
@@ -766,6 +809,12 @@ def command_construct(args: argparse.Namespace) -> int:
         historical_holdings,
         match_sectors=args.sector_match,
         progress_label="Construct",
+    )
+    attach_tracking_model_artifact(
+        portfolio,
+        args.output,
+        candidates,
+        daily_returns(prices[benchmark]),
     )
     write_json_with_parents(portfolio, args.output)
     print(f"Wrote portfolio to {args.output}")
