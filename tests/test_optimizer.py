@@ -9,7 +9,9 @@ from taxicab.data import Holding, PricePoint
 from taxicab.optimizer import (
     Candidate,
     benchmark_proxy_returns,
+    beam_selection,
     construct_portfolio,
+    index_weighted_weights,
     optimize_weights,
     prepare_tracking_model,
     project_to_bounded_simplex,
@@ -135,6 +137,53 @@ class OptimizerTests(unittest.TestCase):
         self.assertLess(tracking_error(weights, model), tracking_error([0.5, 0.5], model))
         self.assertGreater(weights[0], weights[1])
 
+    def test_index_weighted_weights_normalize_selected_index_weights(self):
+        candidates = [
+            Candidate("A", 0.60, "Tech", beta=1.0, tax_alpha=0.0),
+            Candidate("B", 0.30, "Tech", beta=1.0, tax_alpha=0.0),
+            Candidate("C", 0.10, "Tech", beta=1.0, tax_alpha=0.0),
+        ]
+
+        weights = index_weighted_weights(candidates)
+
+        self.assertAlmostEqual(sum(weights), 1.0, places=9)
+        self.assertAlmostEqual(weights[0], 0.60, places=9)
+        self.assertAlmostEqual(weights[1], 0.30, places=9)
+        self.assertAlmostEqual(weights[2], 0.10, places=9)
+
+    def test_beam_selection_is_deterministic_and_can_match_sector_quotas(self):
+        benchmark_returns = returns([0.01, -0.01, 0.02, -0.02, 0.015, -0.015] * 4)
+        candidates = [
+            Candidate("A", 0.40, "Tech", beta=1.0, tax_alpha=0.03, returns=benchmark_returns),
+            Candidate("B", 0.20, "Tech", beta=1.1, tax_alpha=0.04, returns=benchmark_returns),
+            Candidate("C", 0.30, "Health", beta=1.0, tax_alpha=0.03, returns=benchmark_returns),
+            Candidate("D", 0.10, "Health", beta=0.9, tax_alpha=0.04, returns=benchmark_returns),
+        ]
+
+        first = beam_selection(
+            candidates,
+            sample_size=2,
+            error_margin=0.05,
+            target_tax_alpha=0.03,
+            benchmark_returns=benchmark_returns,
+            target_sectors={"Tech": 0.5, "Health": 0.5},
+            match_sectors=True,
+            beam_width=2,
+        )
+        second = beam_selection(
+            candidates,
+            sample_size=2,
+            error_margin=0.05,
+            target_tax_alpha=0.03,
+            benchmark_returns=benchmark_returns,
+            target_sectors={"Tech": 0.5, "Health": 0.5},
+            match_sectors=True,
+            beam_width=2,
+        )
+
+        self.assertEqual([candidate.ticker for candidate in first], [candidate.ticker for candidate in second])
+        self.assertEqual({candidate.sector for candidate in first}, {"Tech", "Health"})
+
     def test_construct_portfolio_can_match_sector_mix(self):
         benchmark_returns = returns([0.01, -0.01, 0.02, -0.02, 0.015, -0.015] * 8)
         holdings = [
@@ -193,6 +242,59 @@ class OptimizerTests(unittest.TestCase):
         sectors = {position["sector"] for position in positions}
         self.assertEqual(sectors, {"Tech", "Health"})
         self.assertLessEqual(number(metrics["sector_abs_error"]), 0.15)
+
+    def test_construct_portfolio_supports_random_weighted_baseline(self):
+        benchmark_returns = returns([0.01, -0.01, 0.02, -0.02, 0.015, -0.015] * 4)
+        holdings = [
+            Holding("A", 0.50, "Tech"),
+            Holding("B", 0.30, "Tech"),
+            Holding("C", 0.15, "Health"),
+            Holding("D", 0.05, "Health"),
+        ]
+        candidates = [
+            Candidate(holding.ticker, holding.weight, holding.sector, beta=1.0, tax_alpha=0.03, returns=benchmark_returns)
+            for holding in holdings
+        ]
+
+        first = construct_portfolio(
+            candidates,
+            holdings,
+            sample_size=2,
+            error_margin=0.05,
+            target_tax_alpha=0.03,
+            rebalance_frequency="quarterly",
+            benchmark_returns=benchmark_returns,
+            selection_method="random-weighted",
+            weight_method="index-normalized",
+            random_seed=11,
+            allow_constraint_violations=True,
+        )
+        second = construct_portfolio(
+            candidates,
+            holdings,
+            sample_size=2,
+            error_margin=0.05,
+            target_tax_alpha=0.03,
+            rebalance_frequency="quarterly",
+            benchmark_returns=benchmark_returns,
+            selection_method="random-weighted",
+            weight_method="index-normalized",
+            random_seed=11,
+            allow_constraint_violations=True,
+        )
+
+        first_targets = object_map(first["targets"])
+        self.assertEqual(first_targets["selection_method"], "random-weighted")
+        self.assertEqual(first_targets["weight_method"], "index-normalized")
+        self.assertEqual(
+            [position["ticker"] for position in object_list(first["positions"])],
+            [position["ticker"] for position in object_list(second["positions"])],
+        )
+        self.assertAlmostEqual(
+            sum(number(position["weight"]) for position in object_list(first["positions"])),
+            1.0,
+            places=9,
+        )
 
     def test_construct_250_stock_portfolio_satisfies_direct_indexing_sanity_constraints(self):
         benchmark_returns = returns([0.01, -0.008, 0.006, -0.004, 0.003] * 12)
@@ -328,6 +430,69 @@ class OptimizerTests(unittest.TestCase):
         self.assertLessEqual(number(after["cash_weight"]), 0.0001)
         diagnostics = object_list(simulation["harvest_diagnostics"])[0]
         self.assertEqual(diagnostics["replacement_names"], ["AMD", "INTC"])
+
+    def test_portfolio_harvest_simulation_can_use_random_replacements(self):
+        dates = [date(2020, 1, 31), date(2020, 2, 29), date(2020, 3, 31)]
+        benchmark_returns = returns([0.0, 0.0, 0.0])
+        candidates = [
+            Candidate("LOSS", 0.40, "Tech", beta=1.0, tax_alpha=0.05, observations=300, returns=benchmark_returns),
+            Candidate("ALT1", 0.30, "Tech", beta=1.0, tax_alpha=0.05, observations=300, returns=benchmark_returns),
+            Candidate("ALT2", 0.20, "Tech", beta=1.0, tax_alpha=0.05, observations=300, returns=benchmark_returns),
+            Candidate("ALT3", 0.10, "Tech", beta=1.0, tax_alpha=0.05, observations=300, returns=benchmark_returns),
+        ]
+        prices = {
+            "SPY": [PricePoint(day, 100.0) for day in dates],
+            "LOSS": [
+                PricePoint(dates[0], 100.0),
+                PricePoint(dates[1], 80.0),
+                PricePoint(dates[2], 90.0),
+            ],
+            "ALT1": [PricePoint(day, 100.0) for day in dates],
+            "ALT2": [PricePoint(day, 100.0) for day in dates],
+            "ALT3": [PricePoint(day, 100.0) for day in dates],
+        }
+
+        first = simulate_portfolio_harvests(
+            [candidates[0]],
+            [1.0],
+            candidates,
+            prices,
+            "SPY",
+            benchmark_returns,
+            "monthly",
+            error_margin=0.05,
+            target_tax_alpha=0.03,
+            tax_rate=0.30,
+            harvest_threshold_pct=0.05,
+            transaction_cost_bps=0.0,
+            replacement_cost_bps=0.0,
+            replacement_count=1,
+            replacement_method="random",
+            random_seed=23,
+        )
+        second = simulate_portfolio_harvests(
+            [candidates[0]],
+            [1.0],
+            candidates,
+            prices,
+            "SPY",
+            benchmark_returns,
+            "monthly",
+            error_margin=0.05,
+            target_tax_alpha=0.03,
+            tax_rate=0.30,
+            harvest_threshold_pct=0.05,
+            transaction_cost_bps=0.0,
+            replacement_cost_bps=0.0,
+            replacement_count=1,
+            replacement_method="random",
+            random_seed=23,
+        )
+
+        first_event = object_list(first["sample_events"])[0]
+        second_event = object_list(second["sample_events"])[0]
+        self.assertEqual(first["replacement_method"], "random")
+        self.assertEqual(first_event["replacements"], second_event["replacements"])
 
     def test_portfolio_harvest_simulation_can_harvest_daily_between_quarterly_rebalances(self):
         dates = [

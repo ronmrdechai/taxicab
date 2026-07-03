@@ -76,6 +76,62 @@ class CliTests(unittest.TestCase):
             self.assertIn("error_percentage", state["metrics"])
             self.assertIn("tracking_error_annualized_pct", state["metrics"])
 
+    def test_construct_command_accepts_baseline_strategy_flags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "cache"
+            output = Path(tmp) / "portfolio.json"
+            benchmark_returns = [0.01, -0.01, 0.02, -0.02, 0.01, -0.01]
+            holdings = [
+                Holding("AAA", 0.50, "Tech"),
+                Holding("BBB", 0.30, "Tech"),
+                Holding("CCC", 0.20, "Health"),
+            ]
+            prices = {
+                "IDX": price_series(100.0, benchmark_returns),
+                "AAA": price_series(50.0, benchmark_returns),
+                "BBB": price_series(80.0, [item * 1.1 for item in benchmark_returns]),
+                "CCC": price_series(70.0, [item * 0.9 for item in benchmark_returns]),
+            }
+            write_cache(data_dir, holdings, prices, {"index": "IDX"})
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                status = main(
+                    [
+                        "construct",
+                        "--data-dir",
+                        str(data_dir),
+                        "--sample-size",
+                        "2",
+                        "--error-margin",
+                        "0.05",
+                        "--target-tax-alpha",
+                        "0.03",
+                        "--rebalance-frequency",
+                        "monthly",
+                        "--min-observations",
+                        "5",
+                        "--selection-method",
+                        "random-weighted",
+                        "--weight-method",
+                        "index-normalized",
+                        "--replacement-method",
+                        "random",
+                        "--allow-constraint-violations",
+                        "--seed",
+                        "19",
+                        "--output",
+                        str(output),
+                    ]
+                )
+
+            self.assertEqual(status, 0)
+            state = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(state["targets"]["selection_method"], "random-weighted")
+            self.assertEqual(state["targets"]["weight_method"], "index-normalized")
+            self.assertEqual(state["targets"]["replacement_method"], "random")
+            self.assertTrue(state["targets"]["allow_constraint_violations"])
+            self.assertEqual(state["portfolio_harvest_simulation"]["replacement_method"], "random")
+
     def test_compare_command_writes_similarity_report(self):
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "cache"

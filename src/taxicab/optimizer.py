@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import heapq
 import random
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -20,6 +21,11 @@ from .metrics import (
     simulated_realized_loss_rate,
     simulated_tax_alpha,
 )
+
+
+SELECTION_METHODS = {"optimized", "random-weighted", "greedy", "beam"}
+WEIGHT_METHODS = {"slsqp", "index-normalized"}
+REPLACEMENT_METHODS = {"ranked", "random"}
 
 
 @dataclass(frozen=True)
@@ -673,6 +679,19 @@ def index_normalized_weights(candidates: Sequence[Candidate]) -> List[float]:
     return [max(0.0, candidate.index_weight) / total for candidate in candidates]
 
 
+def index_weighted_weights(
+    candidates: Sequence[Candidate],
+    min_weight: float = 0.0,
+    max_weight: Optional[float] = None,
+) -> List[float]:
+    upper_bounds = _benchmark_aware_upper_bounds(candidates, min_weight, max_weight)
+    return _project_to_variable_bounded_simplex_array(
+        index_normalized_weights(candidates),
+        lower=min_weight,
+        uppers=upper_bounds,
+    ).tolist()
+
+
 def candidate_score(
     candidate: Candidate,
     error_margin: float,
@@ -706,6 +725,211 @@ def candidate_score(
     tax_score = (tax_delta / tax_scale) ** 2
     weight_bonus = math.sqrt(max(candidate.index_weight, 0.0))
     return error_score + tax_score - 0.05 * weight_bonus
+
+
+def _weighted_sample_without_replacement(
+    candidates: Sequence[Candidate],
+    sample_size: int,
+    rng: np.random.Generator,
+) -> List[Candidate]:
+    if sample_size <= 0:
+        raise ValueError("sample_size must be positive")
+    if len(candidates) < sample_size:
+        raise ValueError(f"only {len(candidates)} candidates available for sample size {sample_size}")
+    weights = np.asarray([max(0.0, candidate.index_weight) for candidate in candidates], dtype=float)
+    total_weight = float(np.sum(weights))
+    probabilities = weights / total_weight if total_weight > 0 else None
+    indices = rng.choice(len(candidates), size=sample_size, replace=False, p=probabilities)
+    return [candidates[int(index)] for index in indices]
+
+
+def random_weighted_selection(
+    candidates: Sequence[Candidate],
+    sample_size: int,
+    random_seed: int = 7,
+    match_sectors: bool = False,
+    target_sectors: Optional[Dict[str, float]] = None,
+) -> List[Candidate]:
+    rng = np.random.default_rng(random_seed)
+    if not match_sectors or not target_sectors:
+        return _weighted_sample_without_replacement(candidates, sample_size, rng)
+
+    by_sector: Dict[str, List[Candidate]] = {}
+    for candidate in candidates:
+        by_sector.setdefault(candidate.sector, []).append(candidate)
+
+    selected: List[Candidate] = []
+    selected_tickers: Set[str] = set()
+    quotas = _sector_quotas(target_sectors, sample_size)
+    for sector, quota in sorted(quotas.items(), key=lambda item: target_sectors.get(item[0], 0.0), reverse=True):
+        if quota <= 0:
+            continue
+        pool = by_sector.get(sector, [])
+        if not pool:
+            continue
+        count = min(quota, len(pool))
+        for candidate in _weighted_sample_without_replacement(pool, count, rng):
+            selected.append(candidate)
+            selected_tickers.add(candidate.ticker)
+
+    if len(selected) < sample_size:
+        remainder = [candidate for candidate in candidates if candidate.ticker not in selected_tickers]
+        selected.extend(
+            _weighted_sample_without_replacement(
+                remainder,
+                sample_size - len(selected),
+                rng,
+            )
+        )
+    return selected
+
+
+def _selection_score(
+    selection: Sequence[Candidate],
+    *,
+    sample_size: int,
+    error_margin: float,
+    target_tax_alpha: float,
+    benchmark_returns: Dict[date, float],
+    target_sectors: Optional[Dict[str, float]],
+    match_sectors: bool,
+    tax_alpha_mode: str,
+    universe_weight_total: float,
+    tracking_cache: _TrackingArrayCache,
+) -> float:
+    weights = index_normalized_weights(selection)
+    value = objective_value(
+        selection,
+        weights,
+        error_margin,
+        target_tax_alpha,
+        target_sectors if match_sectors and len(selection) == sample_size else None,
+        benchmark_returns=benchmark_returns,
+        tax_alpha_mode=tax_alpha_mode,
+        sector_penalty=10.0 if match_sectors else 0.0,
+        tracking_cache=tracking_cache,
+    )
+    if universe_weight_total > 0:
+        coverage = sum(max(0.0, candidate.index_weight) for candidate in selection) / universe_weight_total
+        value += 25.0 * (1.0 - coverage) ** 2
+    return value
+
+
+def _sector_counts(selection: Sequence[Candidate]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for candidate in selection:
+        counts[candidate.sector] = counts.get(candidate.sector, 0) + 1
+    return counts
+
+
+def beam_selection(
+    candidates: Sequence[Candidate],
+    sample_size: int,
+    error_margin: float,
+    target_tax_alpha: float,
+    benchmark_returns: Dict[date, float],
+    target_sectors: Optional[Dict[str, float]],
+    match_sectors: bool,
+    tax_alpha_mode: str = "closest",
+    beam_width: int = 5,
+    tracking_cache: Optional[_TrackingArrayCache] = None,
+) -> List[Candidate]:
+    if sample_size <= 0:
+        raise ValueError("sample_size must be positive")
+    if len(candidates) < sample_size:
+        raise ValueError(f"only {len(candidates)} candidates available for sample size {sample_size}")
+    if beam_width <= 0:
+        raise ValueError("beam_width must be positive")
+    if tracking_cache is None:
+        tracking_cache = _TrackingArrayCache(candidates, benchmark_returns)
+
+    sorted_candidates = sorted(
+        candidates,
+        key=lambda candidate: (
+            candidate_score(
+                candidate,
+                error_margin,
+                target_tax_alpha,
+                benchmark_returns,
+                tax_alpha_mode,
+                tracking_cache=tracking_cache,
+            ),
+            -candidate.index_weight,
+            candidate.ticker,
+        ),
+    )
+    candidate_by_ticker = {candidate.ticker: candidate for candidate in candidates}
+    universe_weight_total = sum(max(0.0, candidate.index_weight) for candidate in candidates)
+    quotas = _sector_quotas(target_sectors or {}, sample_size) if match_sectors and target_sectors else {}
+    branch_count = max(24, beam_width * 8)
+    states: List[Tuple[str, ...]] = [()]
+
+    for _ in range(sample_size):
+        proposals: List[Tuple[float, Tuple[str, ...]]] = []
+        seen: Set[Tuple[str, ...]] = set()
+        for state in states:
+            selected_tickers = set(state)
+            selected_candidates = [candidate_by_ticker[ticker] for ticker in state]
+            counts = _sector_counts(selected_candidates)
+            additions: List[Candidate] = []
+            for candidate in sorted_candidates:
+                if candidate.ticker in selected_tickers:
+                    continue
+                if quotas and counts.get(candidate.sector, 0) >= quotas.get(candidate.sector, 0):
+                    continue
+                additions.append(candidate)
+                if len(additions) >= branch_count:
+                    break
+            if not additions and quotas:
+                for candidate in sorted_candidates:
+                    if candidate.ticker not in selected_tickers:
+                        additions.append(candidate)
+                        if len(additions) >= branch_count:
+                            break
+            for candidate in additions:
+                proposal = tuple(sorted((*state, candidate.ticker)))
+                if proposal in seen:
+                    continue
+                seen.add(proposal)
+                selection = [candidate_by_ticker[ticker] for ticker in proposal]
+                score = _selection_score(
+                    selection,
+                    sample_size=sample_size,
+                    error_margin=error_margin,
+                    target_tax_alpha=target_tax_alpha,
+                    benchmark_returns=benchmark_returns,
+                    target_sectors=target_sectors,
+                    match_sectors=match_sectors,
+                    tax_alpha_mode=tax_alpha_mode,
+                    universe_weight_total=universe_weight_total,
+                    tracking_cache=tracking_cache,
+                )
+                proposals.append((score, proposal))
+        if not proposals:
+            break
+        states = [
+            proposal
+            for _, proposal in heapq.nsmallest(
+                beam_width,
+                proposals,
+                key=lambda item: (item[0], item[1]),
+            )
+        ]
+
+    if not states or len(states[0]) < sample_size:
+        fallback = initial_selection(
+            candidates,
+            sample_size,
+            error_margin,
+            target_tax_alpha,
+            benchmark_returns,
+            match_sectors,
+            target_sectors,
+            tax_alpha_mode=tax_alpha_mode,
+            tracking_cache=tracking_cache,
+        )
+        return fallback
+    return [candidate_by_ticker[ticker] for ticker in states[0]]
 
 
 def _sector_quotas(targets: Dict[str, float], sample_size: int) -> Dict[str, int]:
@@ -1652,7 +1876,10 @@ def _choose_replacement_plan(
     before_snapshot: Mapping[str, object],
     constraints: ReplayConstraintConfig,
     selected_count: int,
+    replacement_method: str = "ranked",
 ) -> Tuple[List[Tuple[Candidate, float, float]], Dict[str, object], List[str]]:
+    if replacement_method not in REPLACEMENT_METHODS:
+        raise ValueError("replacement_method must be ranked or random")
     best_plan: List[Tuple[Candidate, float, float]] = []
     best_snapshot: Dict[str, object] = {}
     best_violations: List[str] = []
@@ -1707,6 +1934,28 @@ def _choose_replacement_plan(
         cheap_candidates.append(
             (cheap_score, allocation_plan, proposed_values, proposed_total, similarity_score)
         )
+
+    if replacement_method == "random":
+        fallback_plan: List[Tuple[Candidate, float, float]] = []
+        fallback_snapshot: Dict[str, object] = {}
+        fallback_violations: List[str] = []
+        for _, allocation_plan, proposed_values, proposed_total, _ in cheap_candidates:
+            snapshot = _replay_snapshot_from_values(
+                proposed_values,
+                proposed_total,
+                candidate_by_ticker,
+                benchmark_weights,
+                target_sectors,
+                tracking_cache,
+            )
+            allowed, violations = _replay_constraints_allow(before_snapshot, snapshot, constraints, selected_count)
+            if not fallback_plan:
+                fallback_plan = allocation_plan
+                fallback_snapshot = snapshot
+                fallback_violations = violations
+            if allowed:
+                return allocation_plan, snapshot, violations
+        return fallback_plan, fallback_snapshot, fallback_violations
 
     for cheap_score, allocation_plan, proposed_values, proposed_total, _ in sorted(
         cheap_candidates,
@@ -1887,11 +2136,46 @@ def _same_sector_replacements(
     correlation_cache: Optional[_ReturnCorrelationCache] = None,
     relaxed_unavailable: Optional[Set[str]] = None,
     day_prices: Optional[Mapping[str, float]] = None,
+    replacement_method: str = "ranked",
+    rng: Optional[random.Random] = None,
 ) -> List[Candidate]:
     if replacement_count <= 0:
         return []
+    if replacement_method not in REPLACEMENT_METHODS:
+        raise ValueError("replacement_method must be ranked or random")
     unavailable_tickers = unavailable
     relaxed_unavailable_tickers = relaxed_unavailable
+    if replacement_method == "random":
+        replacement_rng = rng or random.Random()
+
+        def has_price(candidate: Candidate) -> bool:
+            price = (
+                day_prices.get(candidate.ticker, 0.0)
+                if day_prices is not None
+                else price_table.get(candidate.ticker, {}).get(day, 0.0)
+            )
+            return price > 0
+
+        pool = [
+            candidate
+            for candidate in universe
+            if candidate.sector == source.sector
+            and candidate.ticker not in unavailable_tickers
+            and (active_tickers is None or candidate.ticker in active_tickers)
+            and has_price(candidate)
+        ]
+        if not pool and relaxed_unavailable_tickers is not None:
+            pool = [
+                candidate
+                for candidate in universe
+                if candidate.sector == source.sector
+                and candidate.ticker not in relaxed_unavailable_tickers
+                and (active_tickers is None or candidate.ticker in active_tickers)
+                and has_price(candidate)
+            ]
+        replacement_rng.shuffle(pool)
+        return pool[:replacement_count]
+
     if ranked_replacements is not None:
         replacements: List[Candidate] = []
         relaxed_replacements: List[Candidate] = []
@@ -2088,8 +2372,12 @@ def simulate_portfolio_harvests(
     harvest_frequency: Optional[str] = None,
     on_progress: Optional[Callable[[int, int, str], None]] = None,
     max_weight_limit: Optional[float] = None,
+    replacement_method: str = "ranked",
+    random_seed: int = 7,
 ) -> Dict[str, object]:
     tax_frequency = harvest_frequency or rebalance_frequency
+    if replacement_method not in REPLACEMENT_METHODS:
+        raise ValueError("replacement_method must be ranked or random")
     benchmark_points = prices.get(benchmark_ticker)
     if not benchmark_points:
         return _empty_harvest_simulation("benchmark prices are missing", rebalance_frequency, tax_frequency)
@@ -2142,6 +2430,7 @@ def simulate_portfolio_harvests(
     candidate_by_ticker = {candidate.ticker: candidate for candidate in universe}
     replacement_scores: Dict[Tuple[str, str], Dict[str, float]] = {}
     correlation_cache = _ReturnCorrelationCache(universe)
+    replacement_rng = random.Random(random_seed)
     ranked_replacements = _ranked_same_sector_replacements(
         universe,
         candidate_scores,
@@ -2311,6 +2600,8 @@ def simulate_portfolio_harvests(
                     correlation_cache=correlation_cache,
                     relaxed_unavailable=relaxed_unavailable,
                     day_prices=day_prices,
+                    replacement_method=replacement_method,
+                    rng=replacement_rng,
                 )
                 before_snapshot = _replay_snapshot(
                     lots,
@@ -2343,6 +2634,7 @@ def simulate_portfolio_harvests(
                     before_snapshot,
                     constraints,
                     len(selected_pairs),
+                    replacement_method=replacement_method,
                 )
                 if not allocation_plan:
                     skipped_no_replacement += 1
@@ -2605,7 +2897,9 @@ def simulate_portfolio_harvests(
         "transaction_cost_bps": transaction_cost_bps,
         "replacement_cost_bps": replacement_cost_bps,
         "replacement_count": replacement_count,
+        "replacement_method": replacement_method,
         "wash_sale_days": wash_sale_days,
+        "random_seed": random_seed,
         "replay_constraints": {
             "tracking_error_limit": constraints.tracking_error_limit,
             "path_tracking_error_limit": constraints.path_tracking_error_limit,
@@ -2669,61 +2963,97 @@ def construct_portfolio(
     selection_iterations: int = 1000,
     weight_iterations: int = 2000,
     random_seed: int = 7,
+    selection_method: str = "optimized",
+    weight_method: str = "slsqp",
+    beam_width: int = 5,
+    replacement_method: str = "ranked",
+    allow_constraint_violations: bool = False,
     show_progress: bool = False,
     progress_label: str = "Optimization",
     replacement_universe: Optional[Sequence[Candidate]] = None,
 ) -> Dict[str, object]:
     if benchmark_returns is None:
         raise ValueError("benchmark_returns are required to optimize error margin")
+    if selection_method not in SELECTION_METHODS:
+        raise ValueError("selection_method must be optimized, random-weighted, greedy, or beam")
+    if weight_method not in WEIGHT_METHODS:
+        raise ValueError("weight_method must be slsqp or index-normalized")
+    if replacement_method not in REPLACEMENT_METHODS:
+        raise ValueError("replacement_method must be ranked or random")
     tax_frequency = harvest_frequency or rebalance_frequency
     construction_error_margin = min(error_margin, 0.02)
     construction_benchmark_returns = benchmark_proxy_returns(candidates) or benchmark_returns
     targets = sector_targets(holdings) if match_sectors else None
     tracking_cache = _TrackingArrayCache(candidates, construction_benchmark_returns)
-    initial = initial_selection(
-        candidates,
-        sample_size,
-        construction_error_margin,
-        target_tax_alpha,
-        construction_benchmark_returns,
-        match_sectors,
-        targets,
-        tax_alpha_mode=tax_alpha_mode,
-        index_weight_priority=True,
-        tracking_cache=tracking_cache,
-    )
-    selected = optimize_selection(
-        candidates,
-        initial,
-        sample_size,
-        construction_error_margin,
-        target_tax_alpha,
-        construction_benchmark_returns,
-        targets,
-        match_sectors,
-        tax_alpha_mode=tax_alpha_mode,
-        iterations=selection_iterations,
-        random_seed=random_seed,
-        show_progress=show_progress,
-        progress_label=f"{progress_label} selection",
-        tracking_cache=tracking_cache,
-    )
-    weights = optimize_weights(
-        selected,
-        construction_error_margin,
-        target_tax_alpha,
-        targets if match_sectors else None,
-        tax_alpha_mode=tax_alpha_mode,
-        iterations=weight_iterations,
-        min_weight=min_weight,
-        max_weight=max_weight,
-        benchmark_returns=construction_benchmark_returns,
-        tracking_error_penalty=tracking_error_penalty,
-        index_anchor_penalty=index_anchor_penalty,
-        sector_band=0.02 if match_sectors else None,
-        show_progress=show_progress,
-        progress_label=f"{progress_label} weights",
-    )
+    if selection_method == "optimized":
+        initial = initial_selection(
+            candidates,
+            sample_size,
+            construction_error_margin,
+            target_tax_alpha,
+            construction_benchmark_returns,
+            match_sectors,
+            targets,
+            tax_alpha_mode=tax_alpha_mode,
+            index_weight_priority=True,
+            tracking_cache=tracking_cache,
+        )
+        selected = optimize_selection(
+            candidates,
+            initial,
+            sample_size,
+            construction_error_margin,
+            target_tax_alpha,
+            construction_benchmark_returns,
+            targets,
+            match_sectors,
+            tax_alpha_mode=tax_alpha_mode,
+            iterations=selection_iterations,
+            random_seed=random_seed,
+            show_progress=show_progress,
+            progress_label=f"{progress_label} selection",
+            tracking_cache=tracking_cache,
+        )
+    elif selection_method == "random-weighted":
+        selected = random_weighted_selection(
+            candidates,
+            sample_size,
+            random_seed=random_seed,
+            match_sectors=match_sectors,
+            target_sectors=targets,
+        )
+    else:
+        selected = beam_selection(
+            candidates,
+            sample_size,
+            construction_error_margin,
+            target_tax_alpha,
+            construction_benchmark_returns,
+            targets,
+            match_sectors,
+            tax_alpha_mode=tax_alpha_mode,
+            beam_width=1 if selection_method == "greedy" else beam_width,
+            tracking_cache=tracking_cache,
+        )
+    if weight_method == "slsqp":
+        weights = optimize_weights(
+            selected,
+            construction_error_margin,
+            target_tax_alpha,
+            targets if match_sectors else None,
+            tax_alpha_mode=tax_alpha_mode,
+            iterations=weight_iterations,
+            min_weight=min_weight,
+            max_weight=max_weight,
+            benchmark_returns=construction_benchmark_returns,
+            tracking_error_penalty=tracking_error_penalty,
+            index_anchor_penalty=index_anchor_penalty,
+            sector_band=0.02 if match_sectors else None,
+            show_progress=show_progress,
+            progress_label=f"{progress_label} weights",
+        )
+    else:
+        weights = index_weighted_weights(selected, min_weight=min_weight, max_weight=max_weight)
     tracking_model = prepare_tracking_model(selected, construction_benchmark_returns)
     metrics = portfolio_metrics(selected, weights, tracking_model=tracking_model)
     price_tracking_model = prepare_tracking_model(selected, benchmark_returns)
@@ -2740,7 +3070,7 @@ def construct_portfolio(
     metrics["constraint_warnings"] = _constraint_warnings(metrics, sample_size)
     hard_violations = _hard_constraint_violations(metrics, selected, weights, sample_size)
     metrics["constraint_violations"] = hard_violations
-    if hard_violations:
+    if hard_violations and not allow_constraint_violations:
         raise ValueError(
             "constructed portfolio violates hard benchmark-fidelity constraints: "
             + "; ".join(hard_violations)
@@ -2778,6 +3108,12 @@ def construct_portfolio(
             "max_weight": max_weight,
             "tracking_error_penalty": tracking_error_penalty,
             "index_anchor_penalty": index_anchor_penalty,
+            "selection_method": selection_method,
+            "weight_method": weight_method,
+            "beam_width": beam_width,
+            "replacement_method": replacement_method,
+            "allow_constraint_violations": allow_constraint_violations,
+            "random_seed": random_seed,
             "tax_metric": tax_metric,
             "tax_assumptions": tax_assumptions or {},
             "rebalance_frequency": rebalance_frequency,

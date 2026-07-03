@@ -141,8 +141,26 @@ def add_construct_arguments(
     if include_sector_match:
         parser.add_argument("--sector-match", action="store_true", help="Match sector weights to the index.")
     parser.add_argument("--min-observations", type=int, default=252, help="Minimum daily overlap with benchmark.")
+    parser.add_argument(
+        "--selection-method",
+        choices=["optimized", "random-weighted", "greedy", "beam"],
+        default="optimized",
+        help="Selection backend. Default: optimized.",
+    )
     parser.add_argument("--selection-iterations", type=int, default=1000, help="Random local-search iterations.")
-    parser.add_argument("--weight-iterations", type=int, default=2000, help="Projected-gradient iterations.")
+    parser.add_argument(
+        "--beam-width",
+        type=int,
+        default=5,
+        help="Number of candidate portfolios retained by beam selection. Default: 5.",
+    )
+    parser.add_argument(
+        "--weight-method",
+        choices=["slsqp", "index-normalized"],
+        default="slsqp",
+        help="Weight backend. Default: slsqp.",
+    )
+    parser.add_argument("--weight-iterations", type=int, default=2000, help="SciPy optimizer iterations.")
     parser.add_argument(
         "--min-weight",
         type=float,
@@ -165,6 +183,17 @@ def add_construct_arguments(
         type=float,
         default=25.0,
         help="Penalty for moving away from selected index weights. Default: 25.",
+    )
+    parser.add_argument(
+        "--replacement-method",
+        choices=["ranked", "random"],
+        default="ranked",
+        help="Harvest replacement backend. Default: ranked.",
+    )
+    parser.add_argument(
+        "--allow-constraint-violations",
+        action="store_true",
+        help="Report benchmark-fidelity violations instead of failing construction or harvest replay.",
     )
     progress = parser.add_mutually_exclusive_group()
     progress.add_argument(
@@ -445,10 +474,18 @@ def construct_from_args(
         selection_iterations=args.selection_iterations,
         weight_iterations=args.weight_iterations,
         random_seed=args.seed,
+        selection_method=args.selection_method,
+        weight_method=args.weight_method,
+        beam_width=args.beam_width,
+        replacement_method=args.replacement_method,
+        allow_constraint_violations=args.allow_constraint_violations,
         show_progress=show_progress,
         progress_label=progress_label,
         replacement_universe=replacement_universe,
     )
+    portfolio_targets = portfolio.setdefault("targets", {})
+    if isinstance(portfolio_targets, dict):
+        cast(Dict[str, object], portfolio_targets)["min_observations"] = args.min_observations
     attach_portfolio_context(
         portfolio,
         args.data_dir,
@@ -534,12 +571,17 @@ def attach_portfolio_context(
                     and float(targets["max_weight"]) > 0
                     else None
                 ),
+                replacement_method=str(targets.get("replacement_method", "ranked")),
+                random_seed=int(targets.get("random_seed", 7))
+                if isinstance(targets.get("random_seed"), (int, float))
+                else 7,
             )
         finally:
             if harvest_progress is not None:
                 harvest_progress.close()
         sample_size = int(targets.get("sample_size", 0)) if isinstance(targets, dict) else 0
-        if sample_size >= 50 and simulation.get("status") == "ok":
+        allow_constraint_violations = bool(targets.get("allow_constraint_violations", False))
+        if sample_size >= 50 and simulation.get("status") == "ok" and not allow_constraint_violations:
             replay_violations = []
             path_tracking_error = _float_or_none(simulation.get("portfolio_harvest_tracking_error")) or 0.0
             path_beta = _float_or_none(simulation.get("portfolio_harvest_beta")) or 0.0
@@ -863,6 +905,10 @@ def compare_harvest_replays(
         replacement_cost_bps = _float_default(tax_assumptions.get("replacement_cost_bps"), 10.0)
         replacement_count = _int_default(tax_assumptions.get("replacement_count"), 2)
         wash_sale_days = _int_default(tax_assumptions.get("wash_sale_days"), 31)
+        replacement_method = str(targets.get("replacement_method", "ranked"))
+        if replacement_method not in {"ranked", "random"}:
+            replacement_method = "ranked"
+        random_seed = _int_default(targets.get("random_seed"), 7)
         min_observations = _int_default(targets.get("min_observations"), 2)
         min_observations = max(min_observations, 2)
         cache_key = (
@@ -928,6 +974,8 @@ def compare_harvest_replays(
                 historical_holdings=historical_holdings or None,
                 harvest_frequency=harvest_frequency,
                 max_weight_limit=_positive_float_or_none(targets.get("max_weight")),
+                replacement_method=replacement_method,
+                random_seed=random_seed,
             )
         )
         simulation["selected_position_count"] = len(selected)

@@ -146,7 +146,20 @@ For each candidate stock, the optimizer estimates:
 - **gross harvestable loss rate:** annualized pre-tax loss opportunity across historical harvest windows
 - **sector:** issuer/online sector tag, used to match the index sector mix when requested
 
-The selected portfolio minimizes tracking error against the requested error margin and tax-loss alpha, optionally matching sector weights at the same aggregate level as the index. It then solves long-only weights on the selected names with a constrained SciPy optimizer.
+The selected portfolio minimizes tracking error against the requested error margin and tax-loss alpha, optionally matching sector weights at the same aggregate level as the index. It then solves long-only weights on the selected names with a constrained SciPy optimizer by default.
+
+Construction can also run alternate backends for benchmarking:
+
+- `--selection-method optimized` keeps the default random local-search selection.
+- `--selection-method random-weighted` samples stocks without replacement using index weights as sampling probabilities.
+- `--selection-method greedy` uses deterministic beam search with width 1.
+- `--selection-method beam --beam-width N` keeps the best deterministic candidate portfolios at each selection step.
+- `--weight-method slsqp` keeps the default SciPy SLSQP constrained weight solver.
+- `--weight-method index-normalized` skips continuous weight optimization and normalizes selected index weights.
+- `--replacement-method ranked` keeps the default same-sector, similarity-ranked harvest replacement search.
+- `--replacement-method random` chooses random eligible same-sector replacements during harvest replay.
+
+Random and deterministic baseline methods can violate benchmark-fidelity constraints more easily than the default optimizer. Use `--allow-constraint-violations` to write those runs for comparison while keeping violations in the output metrics.
 
 The default optimizer tax-alpha model buys one lot for each candidate stock, checks it at each `--harvest-frequency` date, harvests only when the unrealized loss is beyond `--harvest-threshold-pct`, applies `--tax-rate` to the realized loss, subtracts round-trip transaction cost and replacement/tracking cost, then resets basis. The older gross metric is still emitted for diagnostics because it explains volatility-driven harvest opportunity, but it is not an after-tax return estimate.
 
