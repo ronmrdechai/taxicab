@@ -9,6 +9,7 @@ description = "Command-line direct indexing optimizer for tracking-error targeti
 readme = "README.md"
 requires-python = ">=3.9"
 authors = [{ name = "TaxiCab" }]
+license = "Apache-2.0"
 dependencies = ["numpy>=2.0", "scipy>=1.13.1", "tqdm>=4.66", "PySCIPOpt>=6.0"]
 
 [project.scripts]
