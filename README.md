@@ -16,10 +16,10 @@ python3 -m pip install -e .
 You can also run it through `uv` without installing:
 
 ```bash
-UV_CACHE_DIR=.uv-cache PYTHONPATH=src uv run --with numpy --with scipy --with tqdm --no-project python -m taxicab.cli --help
+UV_CACHE_DIR=.uv-cache PYTHONPATH=src uv run --with numpy --with scipy --with tqdm --with PySCIPOpt --no-project python -m taxicab.cli --help
 ```
 
-NumPy and SciPy are required dependencies. NumPy is used for tracking-error covariance math, and SciPy is used for constrained continuous weight optimization.
+NumPy, SciPy, and PySCIPOpt are required dependencies. NumPy is used for tracking-error covariance math, SciPy is used for constrained continuous weight optimization, and PySCIPOpt is used for optional MIQP selection.
 
 ## Data Model
 
@@ -155,12 +155,13 @@ Construction can also run alternate backends for benchmarking:
 - `--selection-method random-weighted` samples stocks without replacement using index weights as sampling probabilities.
 - `--selection-method greedy` uses deterministic beam search with width 1.
 - `--selection-method beam --beam-width N` keeps the best deterministic candidate portfolios at each selection step.
+- `--selection-method miqp` uses PySCIPOpt to solve a mixed-integer quadratic selection model with binary inclusion variables and continuous weights.
 - `--weight-method slsqp` keeps the default SciPy SLSQP constrained weight solver.
 - `--weight-method index-normalized` skips continuous weight optimization and normalizes selected index weights.
 - `--replacement-method ranked` keeps the default same-sector, similarity-ranked harvest replacement search.
 - `--replacement-method random` chooses random eligible same-sector replacements during harvest replay.
 
-Random and deterministic baseline methods can violate benchmark-fidelity constraints more easily than the default optimizer. Use `--allow-constraint-violations` to write those runs for comparison while keeping violations in the output metrics.
+Random, deterministic baseline, and MIQP methods can violate benchmark-fidelity constraints more easily than the default optimizer. Use `--allow-constraint-violations` to write those runs for comparison while keeping violations in the output metrics. To compare methods, construct one portfolio per method and pass them to `taxicab compare --html-output`.
 
 The default optimizer tax-alpha model buys one lot for each candidate stock, checks it at each `--harvest-frequency` date, harvests only when the unrealized loss is beyond `--harvest-threshold-pct`, applies `--tax-rate` to the realized loss, subtracts round-trip transaction cost and replacement/tracking cost, then resets basis. The older gross metric is still emitted for diagnostics because it explains volatility-driven harvest opportunity, but it is not an after-tax return estimate.
 
@@ -185,5 +186,5 @@ The script runs `ruff check .`, `ty check .`, and the unit tests through `uv`.
 ## Tests
 
 ```bash
-UV_CACHE_DIR=.uv-cache PYTHONPATH=src uv run --with numpy --with scipy --with tqdm --no-project python -m unittest discover -s tests
+UV_CACHE_DIR=.uv-cache PYTHONPATH=src uv run --with numpy --with scipy --with tqdm --with PySCIPOpt --no-project python -m unittest discover -s tests
 ```

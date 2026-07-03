@@ -1,3 +1,4 @@
+import importlib.util
 import unittest
 
 from datetime import date, timedelta
@@ -12,6 +13,7 @@ from taxicab.optimizer import (
     beam_selection,
     construct_portfolio,
     index_weighted_weights,
+    miqp_selection,
     optimize_weights,
     prepare_tracking_model,
     project_to_bounded_simplex,
@@ -24,6 +26,7 @@ from taxicab.optimizer import (
 
 
 JsonObject = Dict[str, object]
+HAS_PYSCIPOPT = importlib.util.find_spec("pyscipopt") is not None
 
 
 def returns(values: List[float]) -> Dict[date, float]:
@@ -184,6 +187,32 @@ class OptimizerTests(unittest.TestCase):
         self.assertEqual([candidate.ticker for candidate in first], [candidate.ticker for candidate in second])
         self.assertEqual({candidate.sector for candidate in first}, {"Tech", "Health"})
 
+    @unittest.skipUnless(HAS_PYSCIPOPT, "PySCIPOpt is not installed")
+    def test_miqp_selection_uses_binary_cardinality_model(self):
+        benchmark_returns = returns([0.01, -0.01, 0.02, -0.02, 0.015, -0.015] * 4)
+        candidates = [
+            Candidate("A", 0.40, "Tech", beta=1.0, tax_alpha=0.03, returns=benchmark_returns),
+            Candidate("B", 0.20, "Tech", beta=1.2, tax_alpha=0.06, returns=benchmark_returns),
+            Candidate("C", 0.30, "Health", beta=1.0, tax_alpha=0.03, returns=benchmark_returns),
+            Candidate("D", 0.10, "Health", beta=0.8, tax_alpha=0.06, returns=benchmark_returns),
+        ]
+
+        selected, diagnostics = miqp_selection(
+            candidates,
+            sample_size=2,
+            error_margin=0.05,
+            target_tax_alpha=0.03,
+            benchmark_returns=benchmark_returns,
+            target_sectors={"Tech": 0.5, "Health": 0.5},
+            match_sectors=True,
+            miqp_time_limit=5.0,
+            miqp_gap=0.10,
+        )
+
+        self.assertEqual(len(selected), 2)
+        self.assertEqual(diagnostics["selection_solver"], "PySCIPOpt")
+        self.assertIn("selection_solver_status", diagnostics)
+
     def test_construct_portfolio_can_match_sector_mix(self):
         benchmark_returns = returns([0.01, -0.01, 0.02, -0.02, 0.015, -0.015] * 8)
         holdings = [
@@ -295,6 +324,41 @@ class OptimizerTests(unittest.TestCase):
             1.0,
             places=9,
         )
+
+    @unittest.skipUnless(HAS_PYSCIPOPT, "PySCIPOpt is not installed")
+    def test_construct_portfolio_supports_miqp_selection_method(self):
+        benchmark_returns = returns([0.01, -0.01, 0.02, -0.02, 0.015, -0.015] * 4)
+        holdings = [
+            Holding("A", 0.40, "Tech"),
+            Holding("B", 0.20, "Tech"),
+            Holding("C", 0.30, "Health"),
+            Holding("D", 0.10, "Health"),
+        ]
+        candidates = [
+            Candidate(holding.ticker, holding.weight, holding.sector, beta=1.0, tax_alpha=0.03, returns=benchmark_returns)
+            for holding in holdings
+        ]
+
+        portfolio = construct_portfolio(
+            candidates,
+            holdings,
+            sample_size=2,
+            error_margin=0.05,
+            target_tax_alpha=0.03,
+            rebalance_frequency="quarterly",
+            benchmark_returns=benchmark_returns,
+            selection_method="miqp",
+            miqp_time_limit=5.0,
+            miqp_gap=0.10,
+            allow_constraint_violations=True,
+            weight_iterations=20,
+        )
+
+        metrics = object_map(portfolio["metrics"])
+        targets = object_map(portfolio["targets"])
+        self.assertEqual(targets["selection_method"], "miqp")
+        self.assertEqual(metrics["selection_solver"], "PySCIPOpt")
+        self.assertEqual(len(object_list(portfolio["positions"])), 2)
 
     def test_construct_250_stock_portfolio_satisfies_direct_indexing_sanity_constraints(self):
         benchmark_returns = returns([0.01, -0.008, 0.006, -0.004, 0.003] * 12)

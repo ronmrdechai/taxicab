@@ -20,4 +20,4 @@ run_uv_tool() {
 
 run_uv_tool ruff check .
 run_uv_tool ty check .
-uv run --with numpy --with scipy --with tqdm --no-project python -m unittest discover -s tests
+uv run --with numpy --with scipy --with tqdm --with PySCIPOpt --no-project python -m unittest discover -s tests

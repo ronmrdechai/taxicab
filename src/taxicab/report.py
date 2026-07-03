@@ -4,7 +4,7 @@ import math
 from dataclasses import dataclass
 from html import escape
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence
+from typing import Dict, List, Mapping, Optional, Sequence, cast
 
 
 @dataclass(frozen=True)
@@ -742,7 +742,7 @@ def _value_at(mapping: Mapping[str, object], path: Sequence[str]) -> object:
     for key in path:
         if not isinstance(current, Mapping):
             return None
-        current = current.get(key)
+        current = cast(Mapping[str, object], current).get(key)
     return current
 
 
@@ -786,13 +786,13 @@ def _has_harvest_replay(portfolios: Mapping[str, object]) -> bool:
 
 def _mapping(value: object) -> Mapping[str, object]:
     if isinstance(value, Mapping):
-        return value
+        return cast(Mapping[str, object], value)
     return {}
 
 
 def _list(value: object) -> List[object]:
     if isinstance(value, list):
-        return value
+        return cast(List[object], value)
     return []
 
 

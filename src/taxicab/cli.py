@@ -144,7 +144,7 @@ def add_construct_arguments(
     parser.add_argument("--min-observations", type=int, default=252, help="Minimum daily overlap with benchmark.")
     parser.add_argument(
         "--selection-method",
-        choices=["optimized", "random-weighted", "greedy", "beam"],
+        choices=["optimized", "random-weighted", "greedy", "beam", "miqp"],
         default="optimized",
         help="Selection backend. Default: optimized.",
     )
@@ -162,6 +162,18 @@ def add_construct_arguments(
         help="Weight backend. Default: slsqp.",
     )
     parser.add_argument("--weight-iterations", type=int, default=2000, help="SciPy optimizer iterations.")
+    parser.add_argument(
+        "--miqp-time-limit",
+        type=float,
+        default=60.0,
+        help="Maximum seconds for MIQP selection. Default: 60.",
+    )
+    parser.add_argument(
+        "--miqp-gap",
+        type=float,
+        default=0.01,
+        help="Relative optimality gap target for MIQP selection. Default: 0.01.",
+    )
     parser.add_argument(
         "--min-weight",
         type=float,
@@ -479,6 +491,8 @@ def construct_from_args(
         selection_method=args.selection_method,
         weight_method=args.weight_method,
         beam_width=args.beam_width,
+        miqp_time_limit=args.miqp_time_limit,
+        miqp_gap=args.miqp_gap,
         replacement_method=args.replacement_method,
         allow_constraint_violations=args.allow_constraint_violations,
         show_progress=show_progress,

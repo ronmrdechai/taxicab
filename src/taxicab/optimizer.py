@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import heapq
+import importlib
 import random
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -23,7 +24,7 @@ from .metrics import (
 )
 
 
-SELECTION_METHODS = {"optimized", "random-weighted", "greedy", "beam"}
+SELECTION_METHODS = {"optimized", "random-weighted", "greedy", "beam", "miqp"}
 WEIGHT_METHODS = {"slsqp", "index-normalized"}
 REPLACEMENT_METHODS = {"ranked", "random"}
 
@@ -930,6 +931,178 @@ def beam_selection(
         )
         return fallback
     return [candidate_by_ticker[ticker] for ticker in states[0]]
+
+
+def _load_pyscipopt():
+    try:
+        return importlib.import_module("pyscipopt")
+    except ImportError as exc:
+        raise RuntimeError(
+            "MIQP selection requires the PySCIPOpt Python package. "
+            "Install project dependencies or run with PySCIPOpt available."
+        ) from exc
+
+
+def _miqp_upper_bounds(
+    candidates: Sequence[Candidate],
+    min_weight: float,
+    max_weight: Optional[float],
+    sample_size: int,
+) -> np.ndarray:
+    if not candidates:
+        return np.asarray([], dtype=float)
+    scalar_cap = float(max_weight) if max_weight is not None else _default_scalar_max_weight(sample_size)
+    if scalar_cap <= 0:
+        raise ValueError("max_weight must be positive")
+    if min_weight > scalar_cap:
+        raise ValueError("min_weight cannot exceed max_weight")
+    if sample_size * min_weight > 1.0 + 1e-12:
+        raise ValueError("min_weight is too large for the sample size")
+    if sample_size * scalar_cap < 1.0 - 1e-12:
+        raise ValueError("max_weight is too small for the sample size")
+    return np.full(len(candidates), scalar_cap, dtype=float)
+
+
+def miqp_selection(
+    candidates: Sequence[Candidate],
+    sample_size: int,
+    error_margin: float,
+    target_tax_alpha: float,
+    benchmark_returns: Dict[date, float],
+    target_sectors: Optional[Dict[str, float]],
+    match_sectors: bool,
+    tax_alpha_mode: str = "closest",
+    min_weight: float = 0.0,
+    max_weight: Optional[float] = None,
+    tracking_error_penalty: float = 6.0,
+    tax_penalty: float = 0.20,
+    sector_penalty: float = 12.0,
+    concentration_penalty: float = 0.05,
+    index_anchor_penalty: float = 25.0,
+    beta_target: float = 1.0,
+    beta_band: float = 0.02,
+    beta_penalty: float = 4.0,
+    miqp_time_limit: Optional[float] = 60.0,
+    miqp_gap: Optional[float] = 0.01,
+) -> Tuple[List[Candidate], Dict[str, object]]:
+    if tax_alpha_mode not in {"closest", "at-least"}:
+        raise ValueError("tax_alpha_mode must be closest or at-least")
+    if sample_size <= 0:
+        raise ValueError("sample_size must be positive")
+    if len(candidates) < sample_size:
+        raise ValueError(f"only {len(candidates)} candidates available for sample size {sample_size}")
+    if error_margin <= 0:
+        raise ValueError("error_margin must be positive")
+
+    tracking_model = prepare_tracking_model(candidates, benchmark_returns)
+    if tracking_model is None:
+        raise ValueError("benchmark returns and candidate returns are required to optimize error margin")
+
+    pyscipopt = _load_pyscipopt()
+    nonlinear_recipe = importlib.import_module("pyscipopt.recipes.nonlinear")
+    model = pyscipopt.Model("taxicab_miqp_selection")
+    model.hideOutput()
+    if miqp_time_limit is not None and miqp_time_limit > 0:
+        model.setParam("limits/time", float(miqp_time_limit))
+    if miqp_gap is not None and miqp_gap > 0:
+        model.setParam("limits/gap", float(miqp_gap))
+
+    count = len(candidates)
+    upper_bounds = _miqp_upper_bounds(candidates, min_weight, max_weight, sample_size)
+    selected_vars = [
+        model.addVar(vtype="B", name=f"x_{idx}_{candidate.ticker}")
+        for idx, candidate in enumerate(candidates)
+    ]
+    weight_vars = [
+        model.addVar(lb=0.0, ub=float(upper_bounds[idx]), vtype="C", name=f"w_{idx}_{candidate.ticker}")
+        for idx, candidate in enumerate(candidates)
+    ]
+    quicksum = pyscipopt.quicksum
+
+    model.addCons(quicksum(selected_vars) == sample_size, name="sample_size")
+    model.addCons(quicksum(weight_vars) == 1.0, name="fully_invested")
+    for idx in range(count):
+        model.addCons(weight_vars[idx] <= float(upper_bounds[idx]) * selected_vars[idx], name=f"upper_link_{idx}")
+        if min_weight > 0:
+            model.addCons(weight_vars[idx] >= float(min_weight) * selected_vars[idx], name=f"lower_link_{idx}")
+
+    tax_values = [float(candidate.tax_alpha) for candidate in candidates]
+    beta_values = [float(candidate.beta) for candidate in candidates]
+    anchor_weights = index_normalized_weights(candidates)
+    tax_expr = quicksum(tax_values[idx] * weight_vars[idx] for idx in range(count))
+    beta_expr = quicksum(beta_values[idx] * weight_vars[idx] for idx in range(count))
+    tax_scale = max(abs(target_tax_alpha), 0.005)
+    tracking_error_scale = max(error_margin, 0.005) ** 2
+
+    active_variance_expr = quicksum(
+        float(tracking_model.covariance_matrix[row, column]) * weight_vars[row] * weight_vars[column]
+        for row in range(count)
+        for column in range(count)
+        if abs(float(tracking_model.covariance_matrix[row, column])) > 1e-16
+    )
+    active_variance_expr -= 2.0 * quicksum(
+        float(tracking_model.asset_benchmark_covariance[idx]) * weight_vars[idx]
+        for idx in range(count)
+    )
+
+    objective = (
+        tracking_error_penalty
+        * tracking_model.annualization
+        * active_variance_expr
+        / tracking_error_scale
+    )
+    if tax_alpha_mode == "at-least":
+        shortfall = model.addVar(lb=0.0, vtype="C", name="tax_shortfall")
+        model.addCons(shortfall >= float(target_tax_alpha) - tax_expr, name="tax_shortfall_floor")
+        objective += tax_penalty * shortfall * shortfall / (tax_scale**2)
+    else:
+        tax_delta = tax_expr - float(target_tax_alpha)
+        objective += tax_penalty * tax_delta * tax_delta / (tax_scale**2)
+
+    if match_sectors and target_sectors:
+        sector_names = sorted(set(target_sectors).union(candidate.sector for candidate in candidates))
+        for sector in sector_names:
+            sector_expr = quicksum(
+                weight_vars[idx]
+                for idx, candidate in enumerate(candidates)
+                if candidate.sector == sector
+            )
+            sector_delta = sector_expr - float(target_sectors.get(sector, 0.0))
+            objective += sector_penalty * sector_delta * sector_delta
+
+    beta_delta = beta_expr - float(beta_target)
+    objective += beta_penalty * beta_delta * beta_delta / (max(beta_band, 0.005) ** 2)
+    objective += concentration_penalty * quicksum(weight_vars[idx] * weight_vars[idx] for idx in range(count))
+    objective += index_anchor_penalty * quicksum(
+        (weight_vars[idx] - float(anchor_weights[idx])) * (weight_vars[idx] - float(anchor_weights[idx]))
+        for idx in range(count)
+    )
+    nonlinear_recipe.set_nonlinear_objective(model, objective, "minimize")
+    model.optimize()
+
+    solution = model.getBestSol()
+    if solution is None:
+        raise RuntimeError(f"MIQP solver did not return a feasible solution; status={model.getStatus()}")
+    selected = [
+        candidate
+        for idx, candidate in enumerate(candidates)
+        if float(model.getSolVal(solution, selected_vars[idx])) >= 0.5
+    ]
+    if len(selected) != sample_size:
+        raise RuntimeError(
+            f"MIQP solver selected {len(selected)} names; expected {sample_size}"
+        )
+    diagnostics: Dict[str, object] = {
+        "selection_solver": "PySCIPOpt",
+        "selection_solver_status": str(model.getStatus()),
+        "selection_solver_objective": float(model.getObjVal()),
+        "selection_solver_gap": float(model.getGap()),
+    }
+    if miqp_time_limit is not None:
+        diagnostics["miqp_time_limit"] = miqp_time_limit
+    if miqp_gap is not None:
+        diagnostics["miqp_gap"] = miqp_gap
+    return selected, diagnostics
 
 
 def _sector_quotas(targets: Dict[str, float], sample_size: int) -> Dict[str, int]:
@@ -2966,6 +3139,8 @@ def construct_portfolio(
     selection_method: str = "optimized",
     weight_method: str = "slsqp",
     beam_width: int = 5,
+    miqp_time_limit: Optional[float] = 60.0,
+    miqp_gap: Optional[float] = 0.01,
     replacement_method: str = "ranked",
     allow_constraint_violations: bool = False,
     show_progress: bool = False,
@@ -2975,7 +3150,7 @@ def construct_portfolio(
     if benchmark_returns is None:
         raise ValueError("benchmark_returns are required to optimize error margin")
     if selection_method not in SELECTION_METHODS:
-        raise ValueError("selection_method must be optimized, random-weighted, greedy, or beam")
+        raise ValueError("selection_method must be optimized, random-weighted, greedy, beam, or miqp")
     if weight_method not in WEIGHT_METHODS:
         raise ValueError("weight_method must be slsqp or index-normalized")
     if replacement_method not in REPLACEMENT_METHODS:
@@ -2985,6 +3160,7 @@ def construct_portfolio(
     construction_benchmark_returns = benchmark_proxy_returns(candidates) or benchmark_returns
     targets = sector_targets(holdings) if match_sectors else None
     tracking_cache = _TrackingArrayCache(candidates, construction_benchmark_returns)
+    selection_diagnostics: Dict[str, object] = {}
     if selection_method == "optimized":
         initial = initial_selection(
             candidates,
@@ -3022,6 +3198,23 @@ def construct_portfolio(
             match_sectors=match_sectors,
             target_sectors=targets,
         )
+    elif selection_method == "miqp":
+        selected, selection_diagnostics = miqp_selection(
+            candidates,
+            sample_size,
+            construction_error_margin,
+            target_tax_alpha,
+            construction_benchmark_returns,
+            targets,
+            match_sectors,
+            tax_alpha_mode=tax_alpha_mode,
+            min_weight=min_weight,
+            max_weight=max_weight,
+            tracking_error_penalty=tracking_error_penalty,
+            index_anchor_penalty=index_anchor_penalty,
+            miqp_time_limit=miqp_time_limit,
+            miqp_gap=miqp_gap,
+        )
     else:
         selected = beam_selection(
             candidates,
@@ -3056,6 +3249,7 @@ def construct_portfolio(
         weights = index_weighted_weights(selected, min_weight=min_weight, max_weight=max_weight)
     tracking_model = prepare_tracking_model(selected, construction_benchmark_returns)
     metrics = portfolio_metrics(selected, weights, tracking_model=tracking_model)
+    metrics.update(selection_diagnostics)
     price_tracking_model = prepare_tracking_model(selected, benchmark_returns)
     if price_tracking_model is not None:
         metrics["price_benchmark_tracking_error"] = tracking_error(weights, price_tracking_model)
@@ -3111,6 +3305,8 @@ def construct_portfolio(
             "selection_method": selection_method,
             "weight_method": weight_method,
             "beam_width": beam_width,
+            "miqp_time_limit": miqp_time_limit,
+            "miqp_gap": miqp_gap,
             "replacement_method": replacement_method,
             "allow_constraint_violations": allow_constraint_violations,
             "random_seed": random_seed,
