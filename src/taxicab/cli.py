@@ -30,6 +30,7 @@ from .data import (
 )
 from .metrics import FREQUENCIES, daily_returns
 from .optimizer import build_candidates, construct_portfolio, simulate_portfolio_harvests
+from .report import write_comparison_html_report
 from .rebalance import plan_rebalance, read_current_positions, write_operations_csv
 
 
@@ -287,6 +288,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Replay each portfolio's harvest/rebalance simulation before comparing performance and tax metrics.",
     )
     compare.add_argument("--output", help="Comparison JSON to write. Defaults to stdout summary only.")
+    compare.add_argument("--html-output", help="Comparison HTML report to write.")
 
     rebalance = subparsers.add_parser("rebalance", help="Emit buy/sell suggestions from current holdings.")
     rebalance.add_argument("--state", required=True, help="Portfolio JSON from construct.")
@@ -873,6 +875,9 @@ def command_compare(args: argparse.Namespace) -> int:
     if args.output:
         write_json_with_parents(comparison, args.output)
         print(f"Wrote comparison to {args.output}")
+    if args.html_output:
+        write_comparison_html_report(comparison, args.html_output)
+        print(f"Wrote HTML comparison report to {args.html_output}")
     print_comparison_summary(comparison)
     return 0
 

@@ -118,7 +118,8 @@ taxicab compare \
   --data-dir ./cache/spy \
   --portfolio no_sector=./runs/spy_sector_study_no_sector.json \
   --portfolio sector=./runs/spy_sector_study_sector.json \
-  --output ./runs/spy_sector_study_comparison.json
+  --output ./runs/spy_sector_study_comparison.json \
+  --html-output ./runs/spy_sector_study_comparison.html
 ```
 
 Produce rebalance suggestions from current positions:

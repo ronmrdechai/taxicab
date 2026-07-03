@@ -182,6 +182,59 @@ class CliTests(unittest.TestCase):
                 0.5,
             )
 
+    def test_compare_command_writes_html_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "cache"
+            left = Path(tmp) / "left.json"
+            right = Path(tmp) / "right.json"
+            html_output = Path(tmp) / "comparison.html"
+            benchmark_returns = [0.01, -0.01, 0.02, -0.02, 0.01, -0.01]
+            holdings = [
+                Holding("AAA", 0.5, "Tech"),
+                Holding("BBB", 0.5, "Health"),
+            ]
+            prices = {
+                "IDX": price_series(100.0, benchmark_returns),
+                "AAA": price_series(50.0, benchmark_returns),
+                "BBB": price_series(80.0, [item * 1.1 for item in benchmark_returns]),
+            }
+            write_cache(data_dir, holdings, prices, {"index": "IDX"})
+            left.write_text(
+                json.dumps({"positions": [{"ticker": "AAA", "weight": 1.0, "sector": "Tech"}]}),
+                encoding="utf-8",
+            )
+            right.write_text(
+                json.dumps({"positions": [{"ticker": "BBB", "weight": 1.0, "sector": "Health"}]}),
+                encoding="utf-8",
+            )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                status = main(
+                    [
+                        "compare",
+                        "--data-dir",
+                        str(data_dir),
+                        "--portfolio",
+                        f"left={left}",
+                        "--portfolio",
+                        f"right={right}",
+                        "--html-output",
+                        str(html_output),
+                    ]
+                )
+
+            self.assertEqual(status, 0)
+            report = html_output.read_text(encoding="utf-8")
+            self.assertIn("<title>Taxicab Comparison Report</title>", report)
+            self.assertIn("Portfolio Metrics", report)
+            self.assertIn("Sector Weights", report)
+            self.assertIn("Pairwise Comparisons", report)
+            self.assertIn("not tax advice", report)
+            self.assertIn("background-color: rgba(35, 134, 54", report)
+            self.assertIn("background-color: rgba(218, 54, 51", report)
+            self.assertIn("Wrote HTML comparison report", stdout.getvalue())
+
     def test_compare_command_can_replay_harvest_performance(self):
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "cache"
