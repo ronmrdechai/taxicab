@@ -963,6 +963,80 @@ def _miqp_upper_bounds(
     return np.full(len(candidates), scalar_cap, dtype=float)
 
 
+def _miqp_warm_start_selection(
+    candidates: Sequence[Candidate],
+    sample_size: int,
+    error_margin: float,
+    target_tax_alpha: float,
+    benchmark_returns: Dict[date, float],
+    target_sectors: Optional[Dict[str, float]],
+    match_sectors: bool,
+    tax_alpha_mode: str,
+) -> List[Candidate]:
+    return initial_selection(
+        candidates,
+        sample_size,
+        error_margin,
+        target_tax_alpha,
+        benchmark_returns,
+        match_sectors,
+        target_sectors,
+        tax_alpha_mode=tax_alpha_mode,
+        index_weight_priority=True,
+    )
+
+
+def _add_miqp_warm_start(
+    model,
+    selected_vars: Sequence[object],
+    weight_vars: Sequence[object],
+    candidates: Sequence[Candidate],
+    sample_size: int,
+    min_weight: float,
+    upper_bounds: np.ndarray,
+    error_margin: float,
+    target_tax_alpha: float,
+    benchmark_returns: Dict[date, float],
+    target_sectors: Optional[Dict[str, float]],
+    match_sectors: bool,
+    tax_alpha_mode: str,
+) -> bool:
+    warm_selection = _miqp_warm_start_selection(
+        candidates,
+        sample_size,
+        error_margin,
+        target_tax_alpha,
+        benchmark_returns,
+        target_sectors,
+        match_sectors,
+        tax_alpha_mode,
+    )
+    warm_tickers = {candidate.ticker for candidate in warm_selection}
+    warm_weights = _project_to_variable_bounded_simplex_array(
+        index_normalized_weights(warm_selection),
+        lower=min_weight,
+        uppers=np.asarray(
+            [
+                float(upper_bounds[idx])
+                for idx, candidate in enumerate(candidates)
+                if candidate.ticker in warm_tickers
+            ],
+            dtype=float,
+        ),
+    )
+    warm_weight_by_ticker = {
+        candidate.ticker: float(weight)
+        for candidate, weight in zip(warm_selection, warm_weights)
+    }
+    solution = model.createSol()
+    for idx, candidate in enumerate(candidates):
+        selected_value = 1.0 if candidate.ticker in warm_tickers else 0.0
+        weight_value = warm_weight_by_ticker.get(candidate.ticker, 0.0)
+        model.setSolVal(solution, selected_vars[idx], selected_value)
+        model.setSolVal(solution, weight_vars[idx], weight_value)
+    return bool(model.addSol(solution))
+
+
 def miqp_selection(
     candidates: Sequence[Candidate],
     sample_size: int,
@@ -1078,6 +1152,21 @@ def miqp_selection(
         for idx in range(count)
     )
     nonlinear_recipe.set_nonlinear_objective(model, objective, "minimize")
+    warm_start_accepted = _add_miqp_warm_start(
+        model,
+        selected_vars,
+        weight_vars,
+        candidates,
+        sample_size,
+        min_weight,
+        upper_bounds,
+        error_margin,
+        target_tax_alpha,
+        benchmark_returns,
+        target_sectors,
+        match_sectors,
+        tax_alpha_mode,
+    )
     model.optimize()
 
     solution = model.getBestSol()
@@ -1097,6 +1186,7 @@ def miqp_selection(
         "selection_solver_status": str(model.getStatus()),
         "selection_solver_objective": float(model.getObjVal()),
         "selection_solver_gap": float(model.getGap()),
+        "selection_warm_start_accepted": warm_start_accepted,
     }
     if miqp_time_limit is not None:
         diagnostics["miqp_time_limit"] = miqp_time_limit
