@@ -23,13 +23,7 @@ CACHE_DIR="$WORK_DIR/cache"
 ARTIFACT_DIR="${TAXICAB_E2E_ARTIFACT_DIR:-$WORK_DIR/artifacts}"
 
 run_taxicab() {
-  uv run \
-    --with numpy \
-    --with scipy \
-    --with tqdm \
-    --with PySCIPOpt \
-    --no-project \
-    python -m taxicab.cli "$@"
+  uv run python -m taxicab.cli "$@"
 }
 
 construct_short() {
