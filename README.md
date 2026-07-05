@@ -16,7 +16,7 @@ python3 -m pip install -e .
 You can also run it through `uv` without installing:
 
 ```bash
-UV_CACHE_DIR=.uv-cache PYTHONPATH=src uv run --with numpy --with scipy --with tqdm --with PySCIPOpt --no-project python -m taxicab.cli --help
+UV_CACHE_DIR=.uv-cache PYTHONPATH=src uv run taxicab -- --help
 ```
 
 NumPy, SciPy, and PySCIPOpt are required dependencies. NumPy is used for tracking-error covariance math, SciPy is used for constrained continuous weight optimization, and PySCIPOpt is used for optional MIQP selection.
@@ -28,7 +28,7 @@ The commands below run Taxicab from a fresh checkout without installing it into 
 1. Confirm the CLI starts:
 
    ```bash
-   UV_CACHE_DIR=.uv-cache PYTHONPATH=src uv run --with numpy --with scipy --with tqdm --with PySCIPOpt --no-project python -m taxicab.cli --help
+   UV_CACHE_DIR=.uv-cache PYTHONPATH=src uv run taxicab -- --help
    ```
 
 2. Download an offline data cache from a holdings export. Replace `./spy_holdings.csv` with your own issuer-provided CSV/XLSX holdings file if you do not want to use SPY data:
@@ -193,7 +193,7 @@ Construction uses `tqdm` progress bars for the selection and weight optimization
 
 Important caveat: simulated tax alpha is still a model, not a tax opinion or a guaranteed realized after-tax return. Real outcomes depend on your tax rate, holding periods, wash-sale management, replacement securities, transaction costs, contribution timing, and actual tax lots.
 
-## Checks
+## Checks and Tests
 
 Run linting, type checking, and the unit test suite before committing changes:
 
@@ -202,12 +202,6 @@ Run linting, type checking, and the unit test suite before committing changes:
 ```
 
 The script runs `ruff check .`, `ty check .`, and the unit tests through `uv`.
-
-## Tests
-
-```bash
-UV_CACHE_DIR=.uv-cache PYTHONPATH=src uv run --with numpy --with scipy --with tqdm --with PySCIPOpt --no-project python -m unittest discover -s tests
-```
 
 ## License
 
