@@ -8,5 +8,5 @@ export UV_CACHE_DIR="${UV_CACHE_DIR:-.uv-cache}"
 export PYTHONPATH="${PYTHONPATH:-src}"
 
 uv run --with ruff --no-project ruff check .
-uv run --with ty --with-editable . --no-project ty check .
+uv run --with ty ty check .
 uv run --with numpy --with scipy --with tqdm --with PySCIPOpt --no-project python -m unittest discover -s tests
