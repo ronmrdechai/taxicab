@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  checks:
+    name: Checks and e2e
+    runs-on: ubuntu-latest
+    env:
+      UV_CACHE_DIR: .uv-cache
+      PYTHONPATH: src
+      TAXICAB_E2E_WORK_DIR: ${{ github.workspace }}/.taxicab-e2e
+      TAXICAB_E2E_ARTIFACT_DIR: ${{ github.workspace }}/e2e-artifacts
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Run checks
+        run: ./scripts/check
+
+      - name: Prepare e2e fixture
+        run: ./scripts/e2e_ci setup
+
+      - name: E2E optimization and rebalance
+        run: ./scripts/e2e_ci optimization-rebalance
+
+      - name: E2E comparison
+        run: ./scripts/e2e_ci comparison
+
+      - name: Upload e2e artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: taxicab-e2e-artifacts
+          path: ${{ env.TAXICAB_E2E_ARTIFACT_DIR }}
+          if-no-files-found: warn

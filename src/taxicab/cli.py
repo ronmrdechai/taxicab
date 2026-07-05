@@ -656,7 +656,8 @@ def attach_tracking_model_artifact(
     for position in positions:
         if not isinstance(position, dict):
             continue
-        ticker = str(position.get("ticker", "")).upper()
+        position_row = cast(Mapping[str, object], position)
+        ticker = str(position_row.get("ticker", "")).upper()
         candidate = candidate_by_ticker.get(ticker)
         if candidate is None:
             continue
