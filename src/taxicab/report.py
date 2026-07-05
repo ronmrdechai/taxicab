@@ -21,6 +21,15 @@ class ComparisonMetric:
     description: str = ""
 
 
+@dataclass(frozen=True)
+class ObjectiveComponent:
+    key: str
+    label: str
+    unit: str
+    value_format: str = "number"
+    description: str = ""
+
+
 PORTFOLIO_METRICS: Sequence[ComparisonMetric] = (
     ComparisonMetric(
         "annualized_return",
@@ -326,15 +335,63 @@ PAIRWISE_HEATMAP_METRICS: Sequence[ComparisonMetric] = (
     ComparisonMetric("tax_lot_action_overlap", "Tax-lot action overlap", ("tax_lot_action_overlap",), "Heatmap", "number"),
 )
 
-OBJECTIVE_COMPONENTS = (
-    ("tracking_error_penalty", "Tracking error penalty"),
-    ("sector_penalty", "Sector penalty"),
-    ("factor_penalty", "Factor penalty"),
-    ("concentration_penalty", "Concentration penalty"),
-    ("transaction_cost", "Transaction cost"),
-    ("tax_benefit", "Tax benefit"),
-    ("wash_sale_penalty", "Wash-sale penalty"),
-    ("cash_penalty", "Cash penalty"),
+OBJECTIVE_COMPONENTS: Sequence[ObjectiveComponent] = (
+    ObjectiveComponent(
+        "tracking_error_penalty",
+        "Tracking error / target",
+        "multiple",
+        "multiple",
+        "Tracking error divided by the target error margin.",
+    ),
+    ObjectiveComponent(
+        "sector_penalty",
+        "Sector distance",
+        "portfolio weight",
+        "pct",
+        "Absolute sector-weight distance from the index.",
+    ),
+    ObjectiveComponent(
+        "factor_penalty",
+        "Beta distance",
+        "beta points",
+        "number",
+        "Absolute distance from beta 1.0.",
+    ),
+    ObjectiveComponent(
+        "concentration_penalty",
+        "Max position weight",
+        "portfolio weight",
+        "pct",
+        "Largest single-position weight.",
+    ),
+    ObjectiveComponent(
+        "transaction_cost",
+        "Transaction cost",
+        "portfolio value",
+        "pct",
+        "Replay transaction cost as a share of portfolio value.",
+    ),
+    ObjectiveComponent(
+        "tax_benefit",
+        "Tax-alpha shortfall benefit",
+        "annualized return",
+        "pct",
+        "Negative values reduce the objective.",
+    ),
+    ObjectiveComponent(
+        "wash_sale_penalty",
+        "Skipped harvest count",
+        "count",
+        "integer",
+        "Skipped harvest attempts from replacement or constraint failures.",
+    ),
+    ObjectiveComponent(
+        "cash_penalty",
+        "Cash drift",
+        "portfolio weight",
+        "pct",
+        "Absolute distance between total position weight and 100%.",
+    ),
 )
 
 
@@ -362,7 +419,7 @@ def render_comparison_html_report(comparison: Mapping[str, object]) -> str:
         _render_pca_embedding(portfolios, labels),
         _render_frontier_chart(portfolios, labels),
         _render_objective_waterfalls(portfolios, labels),
-        _render_pairwise_table(comparison),
+        _render_pairwise_table(comparison, labels),
     ]
     body = "\n".join(section for section in sections if section)
     return """<!doctype html>
@@ -523,6 +580,51 @@ svg.taxicab-viz {{ width: 100%; min-width: 640px; height: 380px; }}
 .heat-cell {{ stroke: #ffffff; stroke-width: 1; }}
 .viz-label {{ fill: #17202a; font-size: 12px; }}
 .viz-muted {{ fill: #617083; font-size: 11px; }}
+.objective-cell {{
+  display: grid;
+  grid-template-columns: minmax(74px, auto) minmax(72px, 1fr);
+  gap: 8px;
+  align-items: center;
+}}
+.objective-value {{
+  font-variant-numeric: tabular-nums;
+}}
+.objective-bar-track {{
+  height: 9px;
+  background: #eef2f6;
+  border-radius: 999px;
+  overflow: hidden;
+}}
+.objective-bar {{
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+}}
+.objective-bar.cost {{ background: rgba(218, 54, 51, 0.45); }}
+.objective-bar.benefit {{ background: rgba(35, 134, 54, 0.45); }}
+.objective-table td:nth-child(3) {{
+  text-align: left;
+  white-space: normal;
+  min-width: 220px;
+  max-width: 420px;
+}}
+.pairwise-picker-table table {{
+  min-width: 520px;
+}}
+.pairwise-picker-table th,
+.pairwise-picker-table td {{
+  text-align: center;
+}}
+.pairwise-picker-table tbody th {{
+  text-align: left;
+}}
+.pairwise-picker-table td {{
+  font-variant-numeric: tabular-nums;
+}}
+.pairwise-picker-table td.pairwise-self {{
+  color: var(--muted);
+  background: #f7f9fb;
+}}
 </style>
 </head>
 <body>
@@ -722,7 +824,7 @@ def _render_pca_embedding(portfolios: Mapping[str, object], labels: Sequence[str
 <svg id="pca-embedding" class="taxicab-viz" role="img" aria-label="Feature-space PCA embedding"></svg>
 </div>
 <script type="application/json" id="pca-embedding-data">{payload}</script>
-<script>{_scatter_script("pca-embedding", "pca-embedding-data", "PC1", "PC2")}</script>
+<script>{_scatter_script("pca-embedding", "pca-embedding-data", "PC1 score", "PC2 score", "standardized units", "standardized units")}</script>
 </section>"""
 
 
@@ -759,72 +861,130 @@ def _render_frontier_chart(portfolios: Mapping[str, object], labels: Sequence[st
 <svg id="frontier-chart" class="taxicab-viz" role="img" aria-label="Efficient frontier chart"></svg>
 </div>
 <script type="application/json" id="frontier-data">{payload}</script>
-<script>{_scatter_script("frontier-chart", "frontier-data", "Tracking error", "Tax alpha / realized loss")}</script>
+<script>{_scatter_script("frontier-chart", "frontier-data", "Tracking error", "Tax alpha / realized loss", "annualized %", "annualized %", "pct", "pct")}</script>
 </section>"""
 
 
 def _render_objective_waterfalls(portfolios: Mapping[str, object], labels: Sequence[str]) -> str:
-    rows = []
+    if not labels:
+        return ""
+    portfolio_values: Dict[str, Dict[str, float]] = {}
     for label in labels:
         decomposition = _mapping(_mapping(portfolios.get(label)).get("objective_decomposition"))
         if not decomposition:
             continue
-        rows.append(
-            {
-                "label": label,
-                "values": [
-                    {"label": display, "value": _numeric(decomposition.get(key)) or 0.0}
-                    for key, display in OBJECTIVE_COMPONENTS
-                ],
-            }
-        )
-    if not rows:
+        portfolio_values[label] = {
+            component.key: _numeric(decomposition.get(component.key)) or 0.0
+            for component in OBJECTIVE_COMPONENTS
+        }
+    if not portfolio_values:
         return ""
-    payload = _json_script_payload(rows)
-    return f"""<section>
-<h2>Objective Decomposition Waterfall</h2>
-<div class="viz-panel">
-<p class="note">Components use exact objective fields when available and otherwise best-effort diagnostics from run metrics.</p>
-<svg id="objective-waterfall" class="taxicab-viz" role="img" aria-label="Objective decomposition waterfall"></svg>
-</div>
-<script type="application/json" id="objective-waterfall-data">{payload}</script>
-<script>{_waterfall_script()}</script>
-</section>"""
 
-
-def _render_pairwise_table(comparison: Mapping[str, object]) -> str:
-    pairs = _list(comparison.get("pairwise"))
-    if not pairs:
-        return ""
-    metric_values = {
-        metric.key: [_value_at(_mapping(pair), metric.path) for pair in pairs]
-        for metric in PAIRWISE_METRICS
-    }
-    header = "".join(f"<th>{escape(metric.label)}</th>" for metric in PAIRWISE_METRICS)
+    active_labels = [label for label in labels if label in portfolio_values]
+    header = "".join(f"<th>{escape(label)}</th>" for label in active_labels)
     rows = []
-    for pair in pairs:
-        pair_map = _mapping(pair)
+    for component in OBJECTIVE_COMPONENTS:
+        values = [portfolio_values[label].get(component.key, 0.0) for label in active_labels]
+        max_abs = max([abs(value) for value in values] + [1e-12])
         cells = []
-        for metric in PAIRWISE_METRICS:
-            value = _value_at(pair_map, metric.path)
-            style = _comparison_style(metric, value, metric_values[metric.key])
-            cells.append(f"<td{style}>{escape(_format_value(value, metric))}</td>")
-        label = "{} vs {}".format(pair_map.get("left", ""), pair_map.get("right", ""))
-        rows.append(f"<tr><th>{escape(label)}</th>{''.join(cells)}</tr>")
+        for value in values:
+            width = min(abs(value) / max_abs * 100.0, 100.0) if max_abs > 0 else 0.0
+            tone = "benefit" if value < 0 else "cost"
+            cells.append(
+                '<td><div class="objective-cell">'
+                f'<span class="objective-value">{escape(_format_objective_value(value, component))}</span>'
+                '<span class="objective-bar-track">'
+                f'<span class="objective-bar {tone}" style="width: {width:.1f}%;"></span>'
+                "</span></div></td>"
+            )
+        rows.append(
+            "<tr>"
+            f"<th>{escape(component.label)}</th>"
+            f"<td>{escape(component.unit)}</td>"
+            f"<td class=\"muted\">{escape(component.description)}</td>"
+            f"{''.join(cells)}"
+            "</tr>"
+        )
     return f"""<section>
-<h2>Pairwise Comparisons</h2>
+<h2>Objective Decomposition</h2>
 <div class="table-wrap">
-<table>
-<thead><tr><th>Pair</th>{header}</tr></thead>
+<table class="objective-table">
+<thead><tr><th>Component</th><th>Unit</th><th>Description</th>{header}</tr></thead>
 <tbody>
 {''.join(rows)}
 </tbody>
 </table>
 </div>
+<p class="note">Components are shown with their own units because they are diagnostics from mixed sources, not a single additive waterfall scale. Green bars are objective benefits; red bars are costs or penalties.</p>
+</section>"""
+
+
+def _render_pairwise_table(comparison: Mapping[str, object], labels: Sequence[str]) -> str:
+    pairs = _list(comparison.get("pairwise"))
+    if len(labels) < 2 or not pairs:
+        return ""
+    metrics = {}
+    pair_maps = [_mapping(pair) for pair in pairs]
+    pair_lookup = {}
+    for pair in pair_maps:
+        left = str(pair.get("left", ""))
+        right = str(pair.get("right", ""))
+        if not left or not right:
+            continue
+        pair_lookup[(left, right)] = pair
+        pair_lookup[(right, left)] = pair
+    for metric in PAIRWISE_METRICS:
+        values = [_value_at(pair, metric.path) for pair in pair_maps]
+        rows = []
+        for row_label in labels:
+            cells = []
+            for col_label in labels:
+                if row_label == col_label:
+                    cells.append({"display": "self", "background": "", "self": True})
+                    continue
+                pair = pair_lookup.get((row_label, col_label))
+                value = _value_at(pair, metric.path) if pair else None
+                cells.append(
+                    {
+                        "display": _format_value(value, metric),
+                        "background": _comparison_background(metric, value, values),
+                        "self": False,
+                    }
+                )
+            rows.append({"label": row_label, "cells": cells})
+        metrics[metric.key] = {
+            "label": metric.label,
+            "description": metric.description,
+            "rows": rows,
+        }
+    payload = _json_script_payload({"labels": list(labels), "metrics": metrics})
+    return f"""<section>
+<h2>Pairwise Comparisons</h2>
+<div class="viz-panel">
+<div class="viz-controls"><label for="pairwise-metric">Metric </label><select id="pairwise-metric"></select></div>
+<div class="table-wrap pairwise-picker-table">
+<table>
+<thead id="pairwise-metric-head"></thead>
+<tbody id="pairwise-metric-body"></tbody>
+</table>
+</div>
+<p class="note" id="pairwise-metric-note"></p>
+</div>
+<script type="application/json" id="pairwise-table-data">{payload}</script>
+<script>{_pairwise_table_script()}</script>
 </section>"""
 
 
 def _comparison_style(
+    metric: ComparisonMetric,
+    value: object,
+    row_values: Sequence[object],
+) -> str:
+    background = _comparison_background(metric, value, row_values)
+    return f' style="background-color: {background};"' if background else ""
+
+
+def _comparison_background(
     metric: ComparisonMetric,
     value: object,
     row_values: Sequence[object],
@@ -835,7 +995,7 @@ def _comparison_style(
     if current is None or len(scores) < 2 or max(scores) == min(scores):
         return ""
     average = sum(scores) / len(scores)
-    return _score_style(current - average, metric.full_intensity_at)
+    return _score_background(current - average, metric.full_intensity_at)
 
 
 def _target_style(
@@ -859,6 +1019,11 @@ def _target_style(
 
 
 def _score_style(delta: float, full_intensity_at: Optional[float]) -> str:
+    background = _score_background(delta, full_intensity_at)
+    return f' style="background-color: {background};"' if background else ""
+
+
+def _score_background(delta: float, full_intensity_at: Optional[float]) -> str:
     if abs(delta) <= 1e-12:
         return ""
     scale = full_intensity_at if full_intensity_at and full_intensity_at > 0 else abs(delta)
@@ -867,7 +1032,7 @@ def _score_style(delta: float, full_intensity_at: Optional[float]) -> str:
         return ""
     alpha = 0.08 + 0.44 * strength
     rgb = "35, 134, 54" if delta > 0 else "218, 54, 51"
-    return f' style="background-color: rgba({rgb}, {alpha:.3f});"'
+    return f"rgba({rgb}, {alpha:.3f})"
 
 
 def _score(metric: ComparisonMetric, value: object) -> Optional[float]:
@@ -913,7 +1078,19 @@ def _format_value(value: object, metric: ComparisonMetric) -> str:
         return _format_percent(number)
     if metric.value_format == "integer":
         return str(int(round(number)))
+    if metric.value_format == "multiple":
+        return f"{number:.2f}x"
     return _format_scalar(number)
+
+
+def _format_objective_value(value: float, component: ObjectiveComponent) -> str:
+    if component.value_format == "pct":
+        return _format_percent(value)
+    if component.value_format == "integer":
+        return str(int(round(value)))
+    if component.value_format == "multiple":
+        return f"{value:.2f}x"
+    return _format_scalar(value)
 
 
 def _format_percent(value: float) -> str:
@@ -982,23 +1159,46 @@ select.addEventListener('change',draw);draw();
 })();"""
 
 
-def _scatter_script(svg_id: str, data_id: str, x_label: str, y_label: str) -> str:
+def _scatter_script(
+    svg_id: str,
+    data_id: str,
+    x_label: str,
+    y_label: str,
+    x_unit: str = "",
+    y_unit: str = "",
+    x_format: str = "number",
+    y_format: str = "number",
+) -> str:
+    x_axis_label = f"{x_label} ({x_unit})" if x_unit else x_label
+    y_axis_label = f"{y_label} ({y_unit})" if y_unit else y_label
     return f"""
 (function(){{
-const pts=JSON.parse(document.getElementById('{data_id}').textContent),svg=document.getElementById('{svg_id}'),w=760,h=360,l=70,r=30,t=25,b=55;svg.setAttribute('viewBox',`0 0 ${{w}} ${{h}}`);svg.innerHTML='';
-const xs=pts.map(p=>p.x),ys=pts.map(p=>p.y),cs=pts.map(p=>p.color||0),ss=pts.map(p=>p.size||1),min=a=>Math.min(...a),max=a=>Math.max(...a),sx=v=>l+(v-min(xs))/((max(xs)-min(xs))||1)*(w-l-r),sy=v=>h-b-(v-min(ys))/((max(ys)-min(ys))||1)*(h-t-b);
-function line(x1,y1,x2,y2){{const e=document.createElementNS('http://www.w3.org/2000/svg','line');e.setAttribute('x1',x1);e.setAttribute('y1',y1);e.setAttribute('x2',x2);e.setAttribute('y2',y2);e.setAttribute('class','axis');svg.appendChild(e);}}line(l,h-b,w-r,h-b);line(l,t,l,h-b);
-let tx=document.createElementNS('http://www.w3.org/2000/svg','text');tx.setAttribute('x',w/2);tx.setAttribute('y',h-14);tx.setAttribute('text-anchor','middle');tx.setAttribute('class','viz-label');tx.textContent='{escape(x_label)}';svg.appendChild(tx);
-let ty=document.createElementNS('http://www.w3.org/2000/svg','text');ty.setAttribute('x',18);ty.setAttribute('y',h/2);ty.setAttribute('transform',`rotate(-90 18 ${{h/2}})`);ty.setAttribute('text-anchor','middle');ty.setAttribute('class','viz-label');ty.textContent='{escape(y_label)}';svg.appendChild(ty);
-const cmin=min(cs),cmax=max(cs),smin=min(ss),smax=max(ss);pts.forEach(p=>{{const ci=((p.color||0)-cmin)/((cmax-cmin)||1),rad=5+12*((p.size||1)-smin)/((smax-smin)||1),c=document.createElementNS('http://www.w3.org/2000/svg','circle');c.setAttribute('cx',sx(p.x));c.setAttribute('cy',sy(p.y));c.setAttribute('r',rad);c.setAttribute('fill',`rgb(${{Math.round(48+180*ci)}}, ${{Math.round(112-60*ci)}}, 196)`);c.setAttribute('fill-opacity','0.72');const title=document.createElementNS('http://www.w3.org/2000/svg','title');title.textContent=`${{p.label}}: x=${{Number(p.x).toFixed(4)}}, y=${{Number(p.y).toFixed(4)}}`;c.appendChild(title);svg.appendChild(c);const label=document.createElementNS('http://www.w3.org/2000/svg','text');label.setAttribute('x',sx(p.x)+rad+3);label.setAttribute('y',sy(p.y)+4);label.setAttribute('class','viz-muted');label.textContent=p.label;svg.appendChild(label);}});
+const pts=JSON.parse(document.getElementById({json.dumps(data_id)}).textContent),svg=document.getElementById({json.dumps(svg_id)}),w=760,h=390,l=88,r=38,t=30,b=76;
+const xAxisLabel={json.dumps(x_axis_label)},yAxisLabel={json.dumps(y_axis_label)},xTooltipLabel={json.dumps(x_label)},yTooltipLabel={json.dumps(y_label)},xFormat={json.dumps(x_format)},yFormat={json.dumps(y_format)};
+svg.setAttribute('viewBox',`0 0 ${{w}} ${{h}}`);svg.innerHTML='';
+if(!pts.length){{return;}}
+const xs=pts.map(p=>Number(p.x)).filter(Number.isFinite),ys=pts.map(p=>Number(p.y)).filter(Number.isFinite),cs=pts.map(p=>Number(p.color||0)).filter(Number.isFinite),ss=pts.map(p=>Number(p.size||1)).filter(Number.isFinite);
+function extent(values){{let lo=Math.min(...values),hi=Math.max(...values);if(lo===hi){{const pad=Math.abs(lo)||1;lo-=pad;hi+=pad;}}else{{const pad=(hi-lo)*0.08;lo-=pad;hi+=pad;}}return [lo,hi];}}
+const [x0,x1]=extent(xs),[y0,y1]=extent(ys),sx=v=>l+(v-x0)/((x1-x0)||1)*(w-l-r),sy=v=>h-b-(v-y0)/((y1-y0)||1)*(h-t-b);
+function fmt(value,format){{let v=Number(value);if(!Number.isFinite(v)){{return 'n/a';}}if(Math.abs(v)<1e-12){{v=0;}}if(format==='pct'){{return (v*100).toFixed(2)+'%';}}if(Math.abs(v)>=100){{return v.toFixed(1);}}if(Math.abs(v)>=10){{return v.toFixed(2);}}return v.toFixed(3);}}
+function add(name,attrs,text){{const e=document.createElementNS('http://www.w3.org/2000/svg',name);Object.entries(attrs).forEach(([k,v])=>e.setAttribute(k,v));if(text!==undefined){{e.textContent=text;}}svg.appendChild(e);return e;}}
+function line(x1,y1,x2,y2,klass='axis'){{add('line',{{x1,y1,x2,y2,class:klass}});}}
+line(l,h-b,w-r,h-b);line(l,t,l,h-b);
+for(let i=0;i<=4;i++){{const xv=x0+(x1-x0)*i/4,x=sx(xv);line(x,h-b,x,h-b+5);add('text',{{x,y:h-b+20,'text-anchor':'middle',class:'viz-muted'}},fmt(xv,xFormat));const yv=y0+(y1-y0)*i/4,y=sy(yv);line(l-5,y,l,y);add('text',{{x:l-9,y:y+4,'text-anchor':'end',class:'viz-muted'}},fmt(yv,yFormat));}}
+add('text',{{x:w/2,y:h-18,'text-anchor':'middle',class:'viz-label'}},xAxisLabel);
+add('text',{{x:20,y:h/2,transform:`rotate(-90 20 ${{h/2}})`,'text-anchor':'middle',class:'viz-label'}},yAxisLabel);
+const cmin=Math.min(...cs,0),cmax=Math.max(...cs,0),smin=Math.min(...ss,1),smax=Math.max(...ss,1);
+pts.forEach(p=>{{const px=Number(p.x),py=Number(p.y);if(!Number.isFinite(px)||!Number.isFinite(py)){{return;}}const ci=(Number(p.color||0)-cmin)/((cmax-cmin)||1),rad=6+10*(Number(p.size||1)-smin)/((smax-smin)||1),c=add('circle',{{cx:sx(px),cy:sy(py),r:rad,fill:`rgb(${{Math.round(48+180*ci)}}, ${{Math.round(112-60*ci)}}, 196)`,'fill-opacity':'0.72'}});const title=document.createElementNS('http://www.w3.org/2000/svg','title');title.textContent=`${{p.label}}: ${{xTooltipLabel}}=${{fmt(px,xFormat)}}, ${{yTooltipLabel}}=${{fmt(py,yFormat)}}`;c.appendChild(title);add('text',{{x:sx(px)+rad+3,y:sy(py)+4,class:'viz-muted'}},p.label);}});
 }})();"""
 
 
-def _waterfall_script() -> str:
+def _pairwise_table_script() -> str:
     return """
 (function(){
-const rows=JSON.parse(document.getElementById('objective-waterfall-data').textContent),svg=document.getElementById('objective-waterfall'),w=860,h=Math.max(360,rows.length*95+80),l=185,r=25,t=30;svg.setAttribute('viewBox',`0 0 ${w} ${h}`);svg.innerHTML='';const maxv=Math.max(...rows.flatMap(row=>row.values.map(v=>Math.abs(v.value))),1);
-rows.forEach((row,ri)=>{const y=t+ri*90,label=document.createElementNS('http://www.w3.org/2000/svg','text');label.setAttribute('x',10);label.setAttribute('y',y+28);label.setAttribute('class','viz-label');label.textContent=row.label;svg.appendChild(label);let x=l;row.values.forEach(item=>{const bw=Math.max(2,Math.abs(item.value)/maxv*(w-l-r)/row.values.length*1.7),rect=document.createElementNS('http://www.w3.org/2000/svg','rect');rect.setAttribute('x',x);rect.setAttribute('y',y);rect.setAttribute('width',bw);rect.setAttribute('height',22);rect.setAttribute('fill',item.value<0?'rgba(35,134,54,0.62)':'rgba(218,54,51,0.50)');const title=document.createElementNS('http://www.w3.org/2000/svg','title');title.textContent=`${item.label}: ${Number(item.value).toFixed(4)}`;rect.appendChild(title);svg.appendChild(rect);const text=document.createElementNS('http://www.w3.org/2000/svg','text');text.setAttribute('x',x);text.setAttribute('y',y+38);text.setAttribute('class','viz-muted');text.textContent=item.label.split(' ')[0];svg.appendChild(text);x+=bw+8;});});
+const data=JSON.parse(document.getElementById('pairwise-table-data').textContent),select=document.getElementById('pairwise-metric'),thead=document.getElementById('pairwise-metric-head'),tbody=document.getElementById('pairwise-metric-body'),note=document.getElementById('pairwise-metric-note');
+Object.entries(data.metrics).forEach(([key,metric])=>{const option=document.createElement('option');option.value=key;option.textContent=metric.label;select.appendChild(option);});
+function draw(){const metric=data.metrics[select.value];thead.innerHTML='';tbody.innerHTML='';note.textContent=metric.description||'';const headRow=document.createElement('tr'),corner=document.createElement('th');corner.textContent=metric.label;headRow.appendChild(corner);data.labels.forEach(label=>{const th=document.createElement('th');th.textContent=label;headRow.appendChild(th);});thead.appendChild(headRow);metric.rows.forEach(row=>{const tr=document.createElement('tr'),label=document.createElement('th');label.textContent=row.label;tr.appendChild(label);row.cells.forEach(cell=>{const td=document.createElement('td');td.textContent=cell.display;if(cell.background){td.style.backgroundColor=cell.background;}if(cell.self){td.className='pairwise-self';}tr.appendChild(td);});tbody.appendChild(tr);});}
+select.addEventListener('change',draw);draw();
 })();"""
 
 
