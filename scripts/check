@@ -7,17 +7,6 @@ cd "$ROOT_DIR"
 export UV_CACHE_DIR="${UV_CACHE_DIR:-.uv-cache}"
 export PYTHONPATH="${PYTHONPATH:-src}"
 
-run_uv_tool() {
-  local tool="$1"
-  shift
-
-  if uv run --no-project which "$tool" >/dev/null 2>&1; then
-    uv run --no-project "$tool" "$@"
-  else
-    uv run --with "$tool" --no-project "$tool" "$@"
-  fi
-}
-
-run_uv_tool ruff check .
+uv run --with ruff --no-project ruff check .
 uv run --with ty --with numpy --with scipy --with tqdm --with PySCIPOpt --no-project ty check .
 uv run --with numpy --with scipy --with tqdm --with PySCIPOpt --no-project python -m unittest discover -s tests
