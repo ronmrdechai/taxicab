@@ -22,8 +22,8 @@ FIXTURE_DIR="$WORK_DIR/fixtures"
 CACHE_DIR="$WORK_DIR/cache"
 ARTIFACT_DIR="${TAXICAB_E2E_ARTIFACT_DIR:-$WORK_DIR/artifacts}"
 
-run_taxicab() {
-  uv run python -m taxicab.cli "$@"
+taxicab() {
+  uv run taxicab "$@"
 }
 
 construct_short() {
@@ -31,7 +31,7 @@ construct_short() {
   local seed="$2"
   shift 2
 
-  run_taxicab construct \
+  taxicab construct \
     --data-dir "$CACHE_DIR" \
     --sample-size 4 \
     --error-margin 0.20 \
@@ -168,7 +168,7 @@ PY
 }
 
 download_cache() {
-  run_taxicab download \
+  taxicab download \
     --index IDX \
     --holdings-csv "$FIXTURE_DIR/holdings.csv" \
     --index-prices-csv "$FIXTURE_DIR/index_prices.csv" \
@@ -226,7 +226,7 @@ optimization_rebalance() {
   require_setup
 
   construct_short "$ARTIFACT_DIR/optimized.json" 11
-  run_taxicab rebalance \
+  taxicab rebalance \
     --state "$ARTIFACT_DIR/optimized.json" \
     --current-csv "$FIXTURE_DIR/current_positions.csv" \
     --output "$ARTIFACT_DIR/orders.csv" \
@@ -295,7 +295,7 @@ comparison() {
     --weight-method index-normalized \
     --allow-constraint-violations
 
-  run_taxicab compare \
+  taxicab compare \
     --data-dir "$CACHE_DIR" \
     --portfolio "baseline=$ARTIFACT_DIR/baseline.json" \
     --portfolio "weighted=$ARTIFACT_DIR/weighted.json" \
