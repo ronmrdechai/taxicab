@@ -484,7 +484,7 @@ def _project_to_bounded_simplex_array(values: Sequence[float], lower: float, upp
 
 
 def _project_to_variable_bounded_simplex_array(
-    values: Sequence[float],
+    values: Sequence[float] | np.ndarray,
     lower: float,
     uppers: Sequence[float] | np.ndarray,
 ) -> np.ndarray:
