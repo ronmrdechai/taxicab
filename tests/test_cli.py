@@ -9,6 +9,7 @@ from pathlib import Path
 from taxicab.cli import main
 from taxicab.data import Holding, PricePoint, write_cache
 from taxicab.optimizer import load_tracking_model_artifact
+from taxicab.report import render_comparison_html_report
 
 
 def price_series(start, returns):
@@ -72,10 +73,12 @@ class CliTests(unittest.TestCase):
             self.assertEqual(state["targets"]["rebalance_frequency"], "monthly")
             self.assertEqual(state["targets"]["harvest_frequency"], "daily")
             self.assertEqual(state["portfolio_harvest_simulation"]["harvest_frequency"], "daily")
+            self.assertEqual(state["version"], 2)
             self.assertIn("beta=", stdout.getvalue())
-            self.assertIn("tracking_error_annualized_pct=", stdout.getvalue())
-            self.assertIn("error_percentage", state["metrics"])
-            self.assertIn("tracking_error_annualized_pct", state["metrics"])
+            self.assertIn("tracking_error=", stdout.getvalue())
+            self.assertIn("construction", state["metrics"])
+            self.assertIn("tracking_error", state["metrics"]["construction"])
+            self.assertIn("harvest_replay", state["metrics"])
             artifact_info = state["tracking_model_artifact"]
             artifact_path = output.parent / artifact_info["path"]
             self.assertTrue(artifact_path.exists())
@@ -214,11 +217,23 @@ class CliTests(unittest.TestCase):
             }
             write_cache(data_dir, holdings, prices, {"index": "IDX"})
             left.write_text(
-                json.dumps({"positions": [{"ticker": "AAA", "weight": 1.0, "sector": "Tech"}]}),
+                json.dumps(
+                    {
+                        "version": 2,
+                        "metrics": {"construction": {}, "selection": {}, "constraints": {}},
+                        "positions": [{"ticker": "AAA", "weight": 1.0, "sector": "Tech"}],
+                    }
+                ),
                 encoding="utf-8",
             )
             right.write_text(
-                json.dumps({"positions": [{"ticker": "BBB", "weight": 1.0, "sector": "Health"}]}),
+                json.dumps(
+                    {
+                        "version": 2,
+                        "metrics": {"construction": {}, "selection": {}, "constraints": {}},
+                        "positions": [{"ticker": "BBB", "weight": 1.0, "sector": "Health"}],
+                    }
+                ),
                 encoding="utf-8",
             )
 
@@ -239,12 +254,70 @@ class CliTests(unittest.TestCase):
 
             self.assertEqual(status, 0)
             comparison = json.loads(output.read_text(encoding="utf-8"))
-            self.assertEqual(comparison["pairwise"][0]["ticker_overlap_count"], 0)
-            self.assertAlmostEqual(comparison["pairwise"][0]["active_share"], 1.0)
+            self.assertEqual(comparison["version"], 2)
+            self.assertEqual(comparison["pairwise"][0]["metrics"]["ticker_overlap_count"], 0)
+            self.assertAlmostEqual(comparison["pairwise"][0]["metrics"]["active_share"], 1.0)
             self.assertAlmostEqual(
-                comparison["portfolios"]["left"]["sector_active_share_to_index"],
+                comparison["portfolios"]["left"]["metrics"]["sector_active_share_to_index"],
                 0.5,
             )
+
+    def test_compare_command_rejects_v1_portfolio_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "cache"
+            old_state = Path(tmp) / "old.json"
+            new_state = Path(tmp) / "new.json"
+            benchmark_returns = [0.01, -0.01, 0.02]
+            holdings = [Holding("AAA", 1.0, "Tech")]
+            prices = {
+                "IDX": price_series(100.0, benchmark_returns),
+                "AAA": price_series(50.0, benchmark_returns),
+            }
+            write_cache(data_dir, holdings, prices, {"index": "IDX"})
+            old_state.write_text(
+                json.dumps({"version": 1, "positions": [{"ticker": "AAA", "weight": 1.0, "sector": "Tech"}]}),
+                encoding="utf-8",
+            )
+            new_state.write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "metrics": {"construction": {}, "selection": {}, "constraints": {}},
+                        "positions": [{"ticker": "AAA", "weight": 1.0, "sector": "Tech"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "unsupported portfolio schema version 1; expected version 2"):
+                main(
+                    [
+                        "compare",
+                        "--data-dir",
+                        str(data_dir),
+                        "--portfolio",
+                        f"old={old_state}",
+                        "--portfolio",
+                        f"new={new_state}",
+                    ]
+                )
+
+    def test_rebalance_command_rejects_v1_portfolio_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state.json"
+            current = Path(tmp) / "current.csv"
+            state.write_text(
+                json.dumps({"version": 1, "positions": [{"ticker": "AAA", "weight": 1.0}]}),
+                encoding="utf-8",
+            )
+            current.write_text("ticker,market_value\nAAA,1000\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "unsupported portfolio schema version 1; expected version 2"):
+                main(["rebalance", "--state", str(state), "--current-csv", str(current)])
+
+    def test_html_report_rejects_v1_comparison(self):
+        with self.assertRaisesRegex(ValueError, "unsupported comparison schema version 1; expected version 2"):
+            render_comparison_html_report({"version": 1})
 
     def test_compare_command_writes_html_report(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -266,14 +339,25 @@ class CliTests(unittest.TestCase):
             left.write_text(
                 json.dumps(
                     {
-                        "metrics": {"simulated_tax_alpha": 0.0123},
+                        "version": 2,
+                        "metrics": {
+                            "construction": {"simulated_tax_alpha": 0.0123},
+                            "selection": {},
+                            "constraints": {},
+                        },
                         "positions": [{"ticker": "AAA", "weight": 1.0, "sector": "Tech"}],
                     }
                 ),
                 encoding="utf-8",
             )
             right.write_text(
-                json.dumps({"positions": [{"ticker": "BBB", "weight": 1.0, "sector": "Health"}]}),
+                json.dumps(
+                    {
+                        "version": 2,
+                        "metrics": {"construction": {}, "selection": {}, "constraints": {}},
+                        "positions": [{"ticker": "BBB", "weight": 1.0, "sector": "Health"}],
+                    }
+                ),
                 encoding="utf-8",
             )
 
@@ -358,7 +442,9 @@ class CliTests(unittest.TestCase):
             left.write_text(
                 json.dumps(
                     {
+                        "version": 2,
                         "targets": targets,
+                        "metrics": {"construction": {}, "selection": {}, "constraints": {}},
                         "positions": [{"ticker": "AAA", "weight": 1.0, "sector": "Tech"}],
                     }
                 ),
@@ -367,7 +453,9 @@ class CliTests(unittest.TestCase):
             right.write_text(
                 json.dumps(
                     {
+                        "version": 2,
                         "targets": targets,
+                        "metrics": {"construction": {}, "selection": {}, "constraints": {}},
                         "positions": [{"ticker": "BBB", "weight": 1.0, "sector": "Tech"}],
                     }
                 ),
@@ -395,12 +483,12 @@ class CliTests(unittest.TestCase):
             comparison = json.loads(output.read_text(encoding="utf-8"))
             left_replay = comparison["portfolios"]["left"]["harvest_replay"]
             right_replay = comparison["portfolios"]["right"]["harvest_replay"]
-            replay_deltas = comparison["pairwise"][0]["harvest_replay_deltas"]["left_minus_right"]
+            replay_deltas = comparison["pairwise"][0]["harvest_replay_delta"]["metrics"]
             self.assertTrue(comparison["harvest_replay"]["enabled"])
             self.assertEqual(left_replay["status"], "ok")
             self.assertEqual(left_replay["selected_position_count"], 1)
             self.assertEqual(left_replay["missing_position_tickers"], [])
-            self.assertGreater(left_replay["harvest_count"], right_replay["harvest_count"])
+            self.assertGreater(left_replay["metrics"]["harvest_count"], right_replay["metrics"]["harvest_count"])
             self.assertGreater(replay_deltas["harvest_count"], 0)
             self.assertIn("left harvest replay:", stdout.getvalue())
             self.assertIn("left vs right harvest replay delta:", stdout.getvalue())

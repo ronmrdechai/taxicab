@@ -2,478 +2,27 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass
 from html import escape
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence, cast
 
-
-@dataclass(frozen=True)
-class ComparisonMetric:
-    key: str
-    label: str
-    path: Sequence[str]
-    group: str
-    description: str
-    value_format: str = "number"
-    better: str = "neutral"
-    target: Optional[float] = None
-    full_intensity_at: Optional[float] = None
-
-
-@dataclass(frozen=True)
-class ObjectiveComponent:
-    key: str
-    label: str
-    unit: str
-    value_format: str = "number"
-    description: str = ""
-
-
-PORTFOLIO_METRICS: Sequence[ComparisonMetric] = (
-    ComparisonMetric(
-        "annualized_return",
-        "Annualized return",
-        ("returns", "annualized_return"),
-        "Performance",
-        "Annualized portfolio return over the comparison price window. Higher values rank better in this report.",
-        "pct",
-        better="higher",
-        full_intensity_at=0.05,
-    ),
-    ComparisonMetric(
-        "benchmark_annualized_active_return",
-        "Active return vs benchmark",
-        ("returns", "benchmark_annualized_active_return"),
-        "Performance",
-        "Portfolio annualized return minus benchmark annualized return over the comparison window. Higher values rank better.",
-        "pct",
-        better="higher",
-        full_intensity_at=0.03,
-    ),
-    ComparisonMetric(
-        "cumulative_return",
-        "Cumulative return",
-        ("returns", "cumulative_return"),
-        "Performance",
-        "Total compounded portfolio return over the comparison price window. Higher values rank better.",
-        "pct",
-        better="higher",
-        full_intensity_at=0.20,
-    ),
-    ComparisonMetric(
-        "max_drawdown",
-        "Max drawdown",
-        ("returns", "max_drawdown"),
-        "Performance",
-        "Largest peak-to-trough decline over the comparison window. Values closer to zero rank better.",
-        "pct",
-        better="target",
-        target=0.0,
-        full_intensity_at=0.10,
-    ),
-    ComparisonMetric(
-        "benchmark_tracking_error",
-        "Tracking error vs benchmark",
-        ("returns", "benchmark_tracking_error"),
-        "Benchmark fit",
-        "Annualized volatility of active returns versus the benchmark. Lower values indicate a closer benchmark fit.",
-        "pct",
-        better="lower",
-        full_intensity_at=0.03,
-    ),
-    ComparisonMetric(
-        "benchmark_beta",
-        "Beta vs benchmark",
-        ("returns", "benchmark_beta"),
-        "Benchmark fit",
-        "Regression beta of portfolio returns against benchmark returns. Values closer to 1.0 rank better.",
-        "number",
-        better="target",
-        target=1.0,
-        full_intensity_at=0.10,
-    ),
-    ComparisonMetric(
-        "active_share_to_index",
-        "Active share to index",
-        ("active_share_to_index",),
-        "Benchmark fit",
-        "Weighted difference between portfolio holdings and index holdings. Lower values indicate a closer benchmark fit.",
-        "pct",
-        better="lower",
-        full_intensity_at=0.15,
-    ),
-    ComparisonMetric(
-        "weighted_overlap_with_index",
-        "Weighted overlap with index",
-        ("weighted_overlap_with_index",),
-        "Benchmark fit",
-        "Share of portfolio weight overlapping index holdings after ticker matching. Higher values indicate a closer benchmark fit.",
-        "pct",
-        better="higher",
-        full_intensity_at=0.15,
-    ),
-    ComparisonMetric(
-        "estimated_tax_alpha",
-        "Estimated tax alpha",
-        ("features", "simulated_tax_alpha"),
-        "Tax metrics",
-        "Construction-time simulated tax-alpha estimate from optimizer inputs. This is a diagnostic, not tax or investment advice.",
-        "pct",
-        better="higher",
-        full_intensity_at=0.02,
-    ),
-    ComparisonMetric(
-        "sector_active_share_to_index",
-        "Sector active share",
-        ("sector_active_share_to_index",),
-        "Sector fit",
-        "Total absolute difference between portfolio sector weights and index sector weights. Lower values indicate closer sector matching.",
-        "pct",
-        better="lower",
-        full_intensity_at=0.05,
-    ),
-    ComparisonMetric(
-        "sector_similarity_to_index",
-        "Sector similarity",
-        ("sector_similarity_to_index",),
-        "Sector fit",
-        "Similarity score between portfolio sector weights and index sector weights. Higher values indicate closer sector matching.",
-        "number",
-        better="higher",
-        full_intensity_at=0.05,
-    ),
-    ComparisonMetric(
-        "sector_overlap_to_index",
-        "Sector overlap with index",
-        ("sector_overlap_to_index",),
-        "Sector fit",
-        "Sector-weight overlap between the portfolio and index. Higher values indicate closer sector matching.",
-        "pct",
-        better="higher",
-        full_intensity_at=0.05,
-    ),
-    ComparisonMetric(
-        "covered_price_weight",
-        "Covered price weight",
-        ("covered_price_weight",),
-        "Data quality",
-        "Share of portfolio weight with usable price history in the comparison window. Higher values indicate better data coverage.",
-        "pct",
-        better="higher",
-        full_intensity_at=0.05,
-    ),
-    ComparisonMetric(
-        "missing_price_tickers",
-        "Missing price tickers",
-        ("missing_price_tickers",),
-        "Data quality",
-        "Tickers missing usable price history for this comparison. Fewer missing tickers rank better.",
-        "list",
-        better="lower_length",
-        full_intensity_at=5.0,
-    ),
-    ComparisonMetric(
-        "position_count",
-        "Position count",
-        ("position_count",),
-        "Data quality",
-        "Number of portfolio positions included in the comparison summary.",
-        "integer",
-    ),
-)
-
-
-HARVEST_REPLAY_METRICS: Sequence[ComparisonMetric] = (
-    ComparisonMetric(
-        "portfolio_simulated_tax_alpha",
-        "Simulated tax alpha",
-        ("harvest_replay", "portfolio_simulated_tax_alpha"),
-        "Harvest replay",
-        "Harvest replay simulated annual tax-alpha diagnostic from the input assumptions. This is not tax advice.",
-        "pct",
-        better="higher",
-        full_intensity_at=0.02,
-    ),
-    ComparisonMetric(
-        "portfolio_realized_loss_rate",
-        "Realized loss rate",
-        ("harvest_replay", "portfolio_realized_loss_rate"),
-        "Harvest replay",
-        "Annualized realized loss rate produced by the harvest replay assumptions. Higher values rank better as a diagnostic.",
-        "pct",
-        better="higher",
-        full_intensity_at=0.02,
-    ),
-    ComparisonMetric(
-        "portfolio_harvest_active_return",
-        "Harvest active return",
-        ("harvest_replay", "portfolio_harvest_active_return"),
-        "Harvest replay",
-        "Annualized active return of the harvest replay portfolio versus the benchmark. Higher values rank better.",
-        "pct",
-        better="higher",
-        full_intensity_at=0.03,
-    ),
-    ComparisonMetric(
-        "portfolio_harvest_tracking_error",
-        "Harvest tracking error",
-        ("harvest_replay", "portfolio_harvest_tracking_error"),
-        "Harvest replay",
-        "Annualized tracking error from the harvest replay path. Lower values indicate closer benchmark tracking.",
-        "pct",
-        better="lower",
-        full_intensity_at=0.03,
-    ),
-    ComparisonMetric(
-        "portfolio_harvest_beta",
-        "Harvest beta",
-        ("harvest_replay", "portfolio_harvest_beta"),
-        "Harvest replay",
-        "Harvest replay beta versus the benchmark. Values closer to 1.0 rank better.",
-        "number",
-        better="target",
-        target=1.0,
-        full_intensity_at=0.10,
-    ),
-    ComparisonMetric(
-        "total_net_tax_benefit",
-        "Total net tax benefit",
-        ("harvest_replay", "total_net_tax_benefit"),
-        "Harvest replay",
-        "Net simulated tax benefit accumulated during harvest replay under the input assumptions. This is not tax advice.",
-        "number",
-        better="higher",
-        full_intensity_at=0.05,
-    ),
-    ComparisonMetric(
-        "terminal_after_tax_wealth_difference",
-        "Terminal after-tax wealth difference",
-        ("harvest_replay", "terminal_after_tax_wealth_difference"),
-        "Harvest replay",
-        "Replay terminal after-tax wealth difference versus the comparison baseline. Higher values rank better as a diagnostic.",
-        "pct",
-        better="higher",
-        full_intensity_at=0.05,
-    ),
-    ComparisonMetric(
-        "total_transaction_cost",
-        "Total transaction cost",
-        ("harvest_replay", "total_transaction_cost"),
-        "Harvest replay",
-        "Total replay transaction cost under the configured assumptions. Lower values rank better.",
-        "number",
-        better="lower",
-        full_intensity_at=0.02,
-    ),
-    ComparisonMetric(
-        "total_replacement_cost",
-        "Total replacement cost",
-        ("harvest_replay", "total_replacement_cost"),
-        "Harvest replay",
-        "Total replay replacement-trade cost under the configured assumptions. Lower values rank better.",
-        "number",
-        better="lower",
-        full_intensity_at=0.02,
-    ),
-    ComparisonMetric(
-        "harvest_count",
-        "Harvest count",
-        ("harvest_replay", "harvest_count"),
-        "Harvest replay",
-        "Number of harvest trades executed by the replay model.",
-        "integer",
-    ),
-    ComparisonMetric(
-        "rebalance_count",
-        "Rebalance count",
-        ("harvest_replay", "rebalance_count"),
-        "Harvest replay",
-        "Number of rebalances executed by the replay model.",
-        "integer",
-    ),
-)
-
-
-PAIRWISE_METRICS: Sequence[ComparisonMetric] = (
-    ComparisonMetric(
-        "ticker_overlap_count",
-        "Ticker overlap",
-        ("ticker_overlap_count",),
-        "Pairwise",
-        "Number of tickers shared by both portfolios in the pair.",
-        "integer",
-    ),
-    ComparisonMetric(
-        "weighted_overlap",
-        "Weighted overlap",
-        ("weighted_overlap",),
-        "Pairwise",
-        "Sum of overlapping weights between the row and column portfolios. Higher values indicate more similar holdings.",
-        "pct",
-        better="higher",
-        full_intensity_at=0.15,
-    ),
-    ComparisonMetric(
-        "active_share",
-        "Pair active share",
-        ("active_share",),
-        "Pairwise",
-        "Weighted holding difference between the row and column portfolios. Lower values indicate more similar holdings.",
-        "pct",
-        better="lower",
-        full_intensity_at=0.15,
-    ),
-    ComparisonMetric(
-        "sector_abs_distance",
-        "Sector distance",
-        ("sector_abs_distance",),
-        "Pairwise",
-        "Total absolute difference between the pair's sector weights. Lower values indicate more similar sector exposure.",
-        "pct",
-        better="lower",
-        full_intensity_at=0.05,
-    ),
-    ComparisonMetric(
-        "sector_similarity",
-        "Sector similarity",
-        ("sector_similarity",),
-        "Pairwise",
-        "Similarity score between the pair's sector weights. Higher values indicate more similar sector exposure.",
-        "number",
-        better="higher",
-        full_intensity_at=0.05,
-    ),
-    ComparisonMetric(
-        "correlation",
-        "Return correlation",
-        ("returns", "correlation"),
-        "Pairwise",
-        "Correlation between the pair's return series over the comparison window. Higher values indicate more similar returns.",
-        "number",
-        better="higher",
-        full_intensity_at=0.10,
-    ),
-    ComparisonMetric(
-        "tracking_error",
-        "Pair tracking error",
-        ("returns", "tracking_error"),
-        "Pairwise",
-        "Annualized tracking-error distance between the pair's returns. Lower values indicate more similar returns.",
-        "pct",
-        better="lower",
-        full_intensity_at=0.03,
-    ),
-)
-
-PAIRWISE_HEATMAP_METRICS: Sequence[ComparisonMetric] = (
-    ComparisonMetric(
-        "weight_cosine_similarity",
-        "Cosine similarity of weights",
-        ("weight_cosine_similarity",),
-        "Heatmap",
-        "Cosine similarity between portfolio weight vectors. Higher values indicate more similar holdings.",
-        "number",
-    ),
-    ComparisonMetric(
-        "active_share",
-        "Active share distance",
-        ("active_share",),
-        "Heatmap",
-        "Pairwise active-share distance between portfolio holdings. Lower values indicate more similar holdings.",
-        "pct",
-    ),
-    ComparisonMetric(
-        "tracking_error",
-        "Tracking-error distance",
-        ("returns", "tracking_error"),
-        "Heatmap",
-        "Annualized tracking-error distance between portfolio return series. Lower values indicate more similar returns.",
-        "pct",
-    ),
-    ComparisonMetric(
-        "sector_abs_distance",
-        "Sector exposure distance",
-        ("sector_abs_distance",),
-        "Heatmap",
-        "Total absolute distance between portfolio sector weights. Lower values indicate more similar sector exposure.",
-        "pct",
-    ),
-    ComparisonMetric(
-        "factor_abs_distance",
-        "Factor exposure distance",
-        ("factor_abs_distance",),
-        "Heatmap",
-        "Total absolute distance between portfolio factor exposures. Lower values indicate more similar factor exposure.",
-        "number",
-    ),
-    ComparisonMetric(
-        "tax_lot_action_overlap",
-        "Tax-lot action overlap",
-        ("tax_lot_action_overlap",),
-        "Heatmap",
-        "Similarity of tax-lot action selections between portfolios when those diagnostics are available.",
-        "number",
-    ),
-)
-
-OBJECTIVE_COMPONENTS: Sequence[ObjectiveComponent] = (
-    ObjectiveComponent(
-        "tracking_error_penalty",
-        "Tracking error / target",
-        "multiple",
-        "multiple",
-        "Tracking error divided by the target error margin.",
-    ),
-    ObjectiveComponent(
-        "sector_penalty",
-        "Sector distance",
-        "portfolio weight",
-        "pct",
-        "Absolute sector-weight distance from the index.",
-    ),
-    ObjectiveComponent(
-        "factor_penalty",
-        "Beta distance",
-        "beta points",
-        "number",
-        "Absolute distance from beta 1.0.",
-    ),
-    ObjectiveComponent(
-        "concentration_penalty",
-        "Max position weight",
-        "portfolio weight",
-        "pct",
-        "Largest single-position weight.",
-    ),
-    ObjectiveComponent(
-        "transaction_cost",
-        "Transaction cost",
-        "portfolio value",
-        "pct",
-        "Replay transaction cost as a share of portfolio value.",
-    ),
-    ObjectiveComponent(
-        "tax_benefit",
-        "Tax-alpha shortfall benefit",
-        "annualized return",
-        "pct",
-        "Negative values reduce the objective.",
-    ),
-    ObjectiveComponent(
-        "wash_sale_penalty",
-        "Skipped harvest count",
-        "count",
-        "integer",
-        "Skipped harvest attempts from replacement or constraint failures.",
-    ),
-    ObjectiveComponent(
-        "cash_penalty",
-        "Cash drift",
-        "portfolio weight",
-        "pct",
-        "Absolute distance between total position weight and 100%.",
-    ),
+from .metric_registry import (
+    OBJECTIVE_COMPONENTS,
+    MetricSpec,
+    ObjectiveComponent,
+    comparison_background,
+    format_metric_value,
+    format_percent,
+    format_scalar,
+    harvest_replay_metric_specs,
+    metric_value,
+    pairwise_heatmap_metrics,
+    pairwise_table_metrics,
+    portfolio_comparison_metric_specs,
+    portfolio_report_metrics,
+    require_schema_version,
+    score_background,
+    specs_for_usage,
 )
 
 
@@ -484,13 +33,12 @@ def write_comparison_html_report(comparison: Mapping[str, object], output_path: 
 
 
 def render_comparison_html_report(comparison: Mapping[str, object]) -> str:
+    require_schema_version(comparison, "comparison")
     benchmark = str(comparison.get("benchmark", "benchmark"))
     created_at = str(comparison.get("created_at", ""))
     portfolios = _mapping(comparison.get("portfolios"))
     labels = list(portfolios)
-    metrics = list(PORTFOLIO_METRICS)
-    if _has_harvest_replay(portfolios):
-        metrics.extend(HARVEST_REPLAY_METRICS)
+    metrics = portfolio_report_metrics(_has_harvest_replay(portfolios))
 
     sections = [
         _render_summary_cards(comparison, labels),
@@ -822,15 +370,15 @@ def _render_sources(comparison: Mapping[str, object]) -> str:
 
 def _render_metric_table(
     title: str,
-    metrics: Sequence[ComparisonMetric],
+    metrics: Sequence[MetricSpec],
     labels: Sequence[str],
     portfolios: Mapping[str, object],
 ) -> str:
     if not labels:
         return ""
-    grouped: Dict[str, List[ComparisonMetric]] = {}
+    grouped: Dict[str, List[MetricSpec]] = {}
     for metric in metrics:
-        values = [_value_at(_mapping(portfolios.get(label)), metric.path) for label in labels]
+        values = [metric_value(_mapping(portfolios.get(label)), metric) for label in labels]
         if any(value is not None for value in values):
             grouped.setdefault(metric.group, []).append(metric)
     if not grouped:
@@ -844,14 +392,13 @@ def _render_metric_table(
             f'<th colspan="{len(labels) + 1}">{escape(group)}</th></tr>'
         )
         for metric in group_metrics:
-            values = [_value_at(_mapping(portfolios.get(label)), metric.path) for label in labels]
+            values = [metric_value(_mapping(portfolios.get(label)), metric) for label in labels]
             cells = []
             for value in values:
                 style = _comparison_style(metric, value, values)
                 cells.append(f"<td{style}>{escape(_format_value(value, metric))}</td>")
             label = escape(metric.label)
-            if metric.description:
-                label = f'<span class="metric-label" title="{escape(metric.description)}">{label}</span>'
+            label = f'<span class="metric-label" title="{escape(metric.description)}">{label}</span>'
             rows.append(f"<tr{_row_tooltip_attrs(metric.description)}><th>{label}</th>{''.join(cells)}</tr>")
     return f"""<section>
 <h2>{escape(title)}</h2>
@@ -913,14 +460,15 @@ def _render_pairwise_heatmap(comparison: Mapping[str, object], labels: Sequence[
     if len(labels) < 2 or not pairs:
         return ""
     metrics = {}
-    for metric in PAIRWISE_HEATMAP_METRICS:
-        matrix = [[1.0 if row == col and "similarity" in metric.key else 0.0 for col in labels] for row in labels]
+    for metric in pairwise_heatmap_metrics():
+        diagonal = metric.diagonal_value if metric.diagonal_value is not None else 0.0
+        matrix = [[diagonal if row == col else 0.0 for col in labels] for row in labels]
         for pair in pairs:
             left = str(pair.get("left", ""))
             right = str(pair.get("right", ""))
             if left not in labels or right not in labels:
                 continue
-            value = _numeric(_value_at(pair, metric.path))
+            value = _numeric(metric_value(pair, metric))
             if value is None:
                 continue
             row = labels.index(left)
@@ -957,17 +505,25 @@ def _render_pca_embedding(portfolios: Mapping[str, object], labels: Sequence[str
 
 
 def _render_frontier_chart(portfolios: Mapping[str, object], labels: Sequence[str]) -> str:
+    frontier_specs = portfolio_comparison_metric_specs() + harvest_replay_metric_specs()
+    x_specs = specs_for_usage(frontier_specs, "frontier_x")
+    y_specs = specs_for_usage(frontier_specs, "frontier_y")
+    color_specs = specs_for_usage(frontier_specs, "frontier_color")
+    size_specs = specs_for_usage(frontier_specs, "frontier_size")
+    if not x_specs or not y_specs:
+        return ""
+    x_spec = x_specs[0]
+    color_spec = color_specs[0] if color_specs else None
+    size_spec = size_specs[0] if size_specs else None
     points = []
     for label in labels:
         summary = _mapping(portfolios.get(label))
-        features = _mapping(summary.get("features"))
-        replay = _mapping(summary.get("harvest_replay"))
-        x_value = _numeric(features.get("tracking_error"))
-        y_value = (
-            _numeric(replay.get("portfolio_simulated_tax_alpha"))
-            or _numeric(features.get("realized_loss_rate"))
-            or _numeric(features.get("simulated_tax_alpha"))
-        )
+        x_value = _numeric(metric_value(summary, x_spec))
+        y_value = None
+        for spec in y_specs:
+            y_value = _numeric(metric_value(summary, spec))
+            if y_value is not None:
+                break
         if x_value is None or y_value is None:
             continue
         points.append(
@@ -975,8 +531,8 @@ def _render_frontier_chart(portfolios: Mapping[str, object], labels: Sequence[st
                 "label": label,
                 "x": x_value,
                 "y": y_value,
-                "color": _numeric(features.get("turnover")) or 0.0,
-                "size": _numeric(features.get("effective_names")) or _numeric(summary.get("active_share_to_index")) or 1.0,
+                "color": (_numeric(metric_value(summary, color_spec)) if color_spec else None) or 0.0,
+                "size": (_numeric(metric_value(summary, size_spec)) if size_spec else None) or 1.0,
             }
         )
     if not points:
@@ -998,7 +554,7 @@ def _render_objective_waterfalls(portfolios: Mapping[str, object], labels: Seque
         return ""
     portfolio_values: Dict[str, Dict[str, float]] = {}
     for label in labels:
-        decomposition = _mapping(_mapping(portfolios.get(label)).get("objective_decomposition"))
+        decomposition = _mapping(_mapping(_mapping(portfolios.get(label)).get("objective_decomposition")).get("metrics"))
         if not decomposition:
             continue
         portfolio_values[label] = {
@@ -1061,8 +617,8 @@ def _render_pairwise_table(comparison: Mapping[str, object], labels: Sequence[st
             continue
         pair_lookup[(left, right)] = pair
         pair_lookup[(right, left)] = pair
-    for metric in PAIRWISE_METRICS:
-        values = [_value_at(pair, metric.path) for pair in pair_maps]
+    for metric in pairwise_table_metrics():
+        values = [metric_value(pair, metric) for pair in pair_maps]
         rows = []
         for row_label in labels:
             cells = []
@@ -1071,7 +627,7 @@ def _render_pairwise_table(comparison: Mapping[str, object], labels: Sequence[st
                     cells.append({"display": "self", "background": "", "self": True})
                     continue
                 pair = pair_lookup.get((row_label, col_label))
-                value = _value_at(pair, metric.path) if pair else None
+                value = metric_value(pair, metric) if pair else None
                 cells.append(
                     {
                         "display": _format_value(value, metric),
@@ -1104,7 +660,7 @@ def _render_pairwise_table(comparison: Mapping[str, object], labels: Sequence[st
 
 
 def _comparison_style(
-    metric: ComparisonMetric,
+    metric: MetricSpec,
     value: object,
     row_values: Sequence[object],
 ) -> str:
@@ -1113,17 +669,11 @@ def _comparison_style(
 
 
 def _comparison_background(
-    metric: ComparisonMetric,
+    metric: MetricSpec,
     value: object,
     row_values: Sequence[object],
 ) -> str:
-    current = _score(metric, value)
-    scores = [_score(metric, item) for item in row_values]
-    scores = [score for score in scores if score is not None]
-    if current is None or len(scores) < 2 or max(scores) == min(scores):
-        return ""
-    average = sum(scores) / len(scores)
-    return _score_background(current - average, metric.full_intensity_at)
+    return comparison_background(metric, value, row_values)
 
 
 def _target_style(
@@ -1143,72 +693,16 @@ def _target_style(
         return ""
     current = -abs(value - target)
     average = sum(scores) / len(scores)
-    return _score_style(current - average, full_intensity_at)
-
-
-def _score_style(delta: float, full_intensity_at: Optional[float]) -> str:
-    background = _score_background(delta, full_intensity_at)
+    background = _score_background(current - average, full_intensity_at)
     return f' style="background-color: {background};"' if background else ""
 
 
 def _score_background(delta: float, full_intensity_at: Optional[float]) -> str:
-    if abs(delta) <= 1e-12:
-        return ""
-    scale = full_intensity_at if full_intensity_at and full_intensity_at > 0 else abs(delta)
-    strength = min(abs(delta) / scale, 1.0)
-    if strength < 0.01:
-        return ""
-    alpha = 0.08 + 0.44 * strength
-    rgb = "35, 134, 54" if delta > 0 else "218, 54, 51"
-    return f"rgba({rgb}, {alpha:.3f})"
+    return score_background(delta, full_intensity_at)
 
 
-def _score(metric: ComparisonMetric, value: object) -> Optional[float]:
-    if metric.better == "neutral":
-        return None
-    if metric.better == "lower_length":
-        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-            return -float(len(value))
-        return None
-    number = _numeric(value)
-    if number is None:
-        return None
-    if metric.better == "higher":
-        return number
-    if metric.better == "lower":
-        return -number
-    if metric.better == "target":
-        target = metric.target if metric.target is not None else 0.0
-        return -abs(number - target)
-    return None
-
-
-def _value_at(mapping: Mapping[str, object], path: Sequence[str]) -> object:
-    current: object = mapping
-    for key in path:
-        if not isinstance(current, Mapping):
-            return None
-        current = cast(Mapping[str, object], current).get(key)
-    return current
-
-
-def _format_value(value: object, metric: ComparisonMetric) -> str:
-    if value is None:
-        return "n/a"
-    if metric.value_format == "list":
-        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-            return ", ".join(str(item) for item in value) if value else "none"
-        return str(value)
-    number = _numeric(value)
-    if number is None:
-        return str(value)
-    if metric.value_format == "pct":
-        return _format_percent(number)
-    if metric.value_format == "integer":
-        return str(int(round(number)))
-    if metric.value_format == "multiple":
-        return f"{number:.2f}x"
-    return _format_scalar(number)
+def _format_value(value: object, metric: MetricSpec) -> str:
+    return format_metric_value(value, metric)
 
 
 def _format_objective_value(value: float, component: ObjectiveComponent) -> str:
@@ -1222,25 +716,25 @@ def _format_objective_value(value: float, component: ObjectiveComponent) -> str:
 
 
 def _format_percent(value: float) -> str:
-    return f"{value * 100.0:.2f}%"
+    return format_percent(value)
 
 
 def _format_scalar(value: object) -> str:
-    number = _numeric(value)
-    if number is None:
-        return "n/a" if value is None else str(value)
-    if math.isclose(number, round(number), abs_tol=1e-9):
-        return f"{int(round(number)):,}"
-    if abs(number) >= 100:
-        return f"{number:,.1f}"
-    if abs(number) >= 10:
-        return f"{number:,.2f}"
-    return f"{number:,.4f}"
+    return format_scalar(value)
 
 
 def _feature_vector(summary: Mapping[str, object]) -> Dict[str, float]:
-    features = _mapping(summary.get("features"))
-    return {str(key): number for key, raw in features.items() if (number := _numeric(raw)) is not None}
+    features = _mapping(summary.get("feature_vector"))
+    values = {str(key): number for key, raw in features.items() if (number := _numeric(raw)) is not None}
+    if values:
+        return values
+    for source in (
+        _mapping(summary.get("metrics")),
+        _mapping(_mapping(summary.get("harvest_replay")).get("metrics")),
+        _mapping(_mapping(summary.get("objective_decomposition")).get("metrics")),
+    ):
+        values.update({str(key): number for key, raw in source.items() if (number := _numeric(raw)) is not None})
+    return values
 
 
 def _pca_points(portfolios: Mapping[str, object], labels: Sequence[str]) -> List[Dict[str, object]]:

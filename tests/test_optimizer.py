@@ -319,10 +319,12 @@ class OptimizerTests(unittest.TestCase):
 
         positions = object_list(portfolio["positions"])
         metrics = object_map(portfolio["metrics"])
+        construction = object_map(metrics["construction"])
         self.assertEqual(len(positions), 2)
         sectors = {position["sector"] for position in positions}
         self.assertEqual(sectors, {"Tech", "Health"})
-        self.assertLessEqual(number(metrics["sector_abs_error"]), 0.15)
+        self.assertEqual(portfolio["version"], 2)
+        self.assertLessEqual(number(construction["sector_abs_error"]), 0.15)
 
     def test_construct_portfolio_supports_random_weighted_baseline(self):
         benchmark_returns = returns([0.01, -0.01, 0.02, -0.02, 0.015, -0.015] * 4)
@@ -406,11 +408,12 @@ class OptimizerTests(unittest.TestCase):
 
         targets = object_map(portfolio["targets"])
         metrics = object_map(portfolio["metrics"])
+        selection = object_map(metrics["selection"])
         positions = object_list(portfolio["positions"])
         self.assertEqual(targets["selection_method"], "random-unbiased")
         self.assertEqual(targets["weight_method"], "random-unbiased")
         self.assertEqual(targets["requested_weight_method"], "slsqp")
-        self.assertEqual(metrics["selection_weighting"], "random_unbiased_pps")
+        self.assertEqual(selection["selection_weighting"], "random_unbiased_pps")
         self.assertAlmostEqual(sum(number(position["weight"]) for position in positions), 1.0, places=9)
         self.assertTrue(all("sample_inclusion_probability" in position for position in positions))
 
@@ -444,9 +447,10 @@ class OptimizerTests(unittest.TestCase):
         )
 
         metrics = object_map(portfolio["metrics"])
+        selection = object_map(metrics["selection"])
         targets = object_map(portfolio["targets"])
         self.assertEqual(targets["selection_method"], "miqp")
-        self.assertEqual(metrics["selection_solver"], "PySCIPOpt")
+        self.assertEqual(selection["selection_solver"], "PySCIPOpt")
         self.assertEqual(len(object_list(portfolio["positions"])), 2)
 
     def test_construct_250_stock_portfolio_satisfies_direct_indexing_sanity_constraints(self):
@@ -486,15 +490,16 @@ class OptimizerTests(unittest.TestCase):
 
         positions = object_list(portfolio["positions"])
         metrics = object_map(portfolio["metrics"])
+        construction = object_map(metrics["construction"])
         weights = [number(position["weight"]) for position in positions]
         self.assertAlmostEqual(sum(weights), 1.0, places=9)
         self.assertLessEqual(max(weights), 0.0080001)
-        self.assertGreater(number(metrics["effective_number_of_names"]), 100.0)
-        self.assertLessEqual(number(metrics["sector_abs_error"]), 0.02)
-        self.assertLessEqual(number(metrics["tracking_error"]), 0.02)
-        self.assertLessEqual(number(metrics["active_share"]), 0.35)
-        self.assertIn("tracking_error_annualized_pct", metrics)
-        self.assertIn("max_weight_pct", metrics)
+        self.assertGreater(number(construction["effective_number_of_names"]), 100.0)
+        self.assertLessEqual(number(construction["sector_abs_error"]), 0.02)
+        self.assertLessEqual(number(construction["tracking_error"]), 0.02)
+        self.assertLessEqual(number(construction["active_share"]), 0.35)
+        self.assertNotIn("tracking_error_annualized_pct", construction)
+        self.assertNotIn("max_weight_pct", construction)
 
     def test_construct_250_stock_portfolio_rejects_hard_fidelity_violations(self):
         benchmark_returns = returns([0.01, -0.008, 0.006, -0.004, 0.003] * 12)
@@ -568,10 +573,10 @@ class OptimizerTests(unittest.TestCase):
         self.assertEqual(simulation["status"], "ok")
         self.assertEqual(simulation["harvest_count"], 1)
         self.assertAlmostEqual(number(simulation["total_realized_loss"]), 0.2, places=9)
-        self.assertGreater(number(simulation["immediate_tax_savings_pct_per_year"]), 0.0)
+        self.assertGreater(number(simulation["immediate_tax_savings_rate"]), 0.0)
         self.assertLess(
-            number(simulation["full_liquidation_after_tax_alpha_pct_per_year"]),
-            number(simulation["immediate_tax_savings_pct_per_year"]),
+            number(simulation["full_liquidation_after_tax_alpha"]),
+            number(simulation["immediate_tax_savings_rate"]),
         )
         event = object_list(simulation["sample_events"])[0]
         self.assertEqual(event["sold"], "NVDA")

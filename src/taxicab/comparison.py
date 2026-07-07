@@ -8,6 +8,16 @@ from typing import Dict, Iterable, List, Mapping, Sequence, Tuple, cast
 
 from .data import Holding, PricePoint, sector_targets
 from .metrics import cumulative_return, daily_returns
+from .metric_registry import (
+    OUTPUT_SCHEMA_VERSION,
+    build_harvest_replay_delta_metrics,
+    build_harvest_replay_summary,
+    build_objective_metrics,
+    build_pairwise_metrics,
+    build_portfolio_comparison_metrics,
+    metric_group,
+    require_schema_version,
+)
 
 
 ANNUALIZATION = 252.0
@@ -27,6 +37,12 @@ def compare_portfolios(
     benchmark_ticker: str,
     harvest_replays: Mapping[str, Mapping[str, object]] | None = None,
 ) -> Dict[str, object]:
+    for label, portfolio in portfolios.items():
+        try:
+            require_schema_version(portfolio, "portfolio")
+        except ValueError as exc:
+            raise ValueError(f"{label}: {exc}") from exc
+
     benchmark = benchmark_ticker.upper()
     if benchmark not in prices:
         raise ValueError(f"benchmark prices missing for {benchmark}")
@@ -50,7 +66,7 @@ def compare_portfolios(
             target_sectors,
         )
         if harvest_replays and label in harvest_replays:
-            summaries[label]["harvest_replay"] = harvest_replay_summary(harvest_replays[label])
+            summaries[label]["harvest_replay"] = build_harvest_replay_summary(harvest_replays[label])
 
     labels = list(portfolios)
     pairs = []
@@ -65,16 +81,15 @@ def compare_portfolios(
                 portfolio_returns[right].values,
             )
             if harvest_replays and left in harvest_replays and right in harvest_replays:
-                pair_summary["harvest_replay_deltas"] = pairwise_harvest_replay_summary(
-                    left,
-                    right,
-                    harvest_replays[left],
-                    harvest_replays[right],
-                )
+                pair_summary["harvest_replay_delta"] = {
+                    "left_status": harvest_replays[left].get("status"),
+                    "right_status": harvest_replays[right].get("status"),
+                    "metrics": build_harvest_replay_delta_metrics(harvest_replays[left], harvest_replays[right]),
+                }
             pairs.append(pair_summary)
 
     return {
-        "version": 1,
+        "version": OUTPUT_SCHEMA_VERSION,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "benchmark": benchmark,
         "index_position_count": len(holdings),
@@ -85,49 +100,7 @@ def compare_portfolios(
 
 
 def harvest_replay_summary(replay: Mapping[str, object]) -> Dict[str, object]:
-    summary_keys = [
-        "status",
-        "reason",
-        "start",
-        "end",
-        "years",
-        "rebalance_frequency",
-        "harvest_frequency",
-        "portfolio_harvest_annualized_return",
-        "benchmark_annualized_return",
-        "portfolio_harvest_active_return",
-        "portfolio_harvest_tracking_error",
-        "portfolio_harvest_tracking_error_annualized_pct",
-        "portfolio_harvest_beta",
-        "portfolio_harvest_correlation",
-        "portfolio_harvest_observations",
-        "portfolio_simulated_tax_alpha",
-        "portfolio_realized_loss_rate",
-        "annual_realized_loss",
-        "total_realized_loss",
-        "total_tax_benefit",
-        "total_transaction_cost",
-        "total_replacement_cost",
-        "total_net_tax_benefit",
-        "realized_loss_rate_pct_per_year",
-        "immediate_tax_savings_pct_per_year",
-        "immediate_net_tax_savings_pct_per_year",
-        "simulated_after_tax_alpha_pct_per_year",
-        "terminal_after_tax_wealth_difference_pct",
-        "harvest_count",
-        "rebalance_count",
-        "skipped_no_replacement",
-        "skipped_nonpositive_net_benefit",
-        "skipped_constraint_violation",
-        "skipped_harvests_by_reason",
-        "selected_position_count",
-        "missing_position_tickers",
-    ]
-    summary = {key: replay[key] for key in summary_keys if key in replay}
-    terminal_pct = _float_or_none(replay.get("terminal_after_tax_wealth_difference_pct"))
-    if terminal_pct is not None:
-        summary["terminal_after_tax_wealth_difference"] = terminal_pct / 100.0
-    return summary
+    return build_harvest_replay_summary(replay)
 
 
 def pairwise_harvest_replay_summary(
@@ -136,41 +109,12 @@ def pairwise_harvest_replay_summary(
     left: Mapping[str, object],
     right: Mapping[str, object],
 ) -> Dict[str, object]:
-    delta_keys = [
-        "portfolio_harvest_annualized_return",
-        "benchmark_annualized_return",
-        "portfolio_harvest_active_return",
-        "portfolio_harvest_tracking_error",
-        "portfolio_harvest_beta",
-        "portfolio_harvest_correlation",
-        "portfolio_simulated_tax_alpha",
-        "portfolio_realized_loss_rate",
-        "annual_realized_loss",
-        "total_realized_loss",
-        "total_tax_benefit",
-        "total_transaction_cost",
-        "total_replacement_cost",
-        "total_net_tax_benefit",
-        "harvest_count",
-        "rebalance_count",
-    ]
-    deltas = {}
-    for key in delta_keys:
-        left_value = _float_or_none(left.get(key))
-        right_value = _float_or_none(right.get(key))
-        if left_value is not None and right_value is not None:
-            deltas[key] = left_value - right_value
-    left_terminal = _float_or_none(left.get("terminal_after_tax_wealth_difference_pct"))
-    right_terminal = _float_or_none(right.get("terminal_after_tax_wealth_difference_pct"))
-    if left_terminal is not None and right_terminal is not None:
-        deltas["terminal_after_tax_wealth_difference"] = (left_terminal - right_terminal) / 100.0
-        deltas["terminal_after_tax_wealth_difference_pct"] = left_terminal - right_terminal
     return {
         "left": left_label,
         "right": right_label,
         "left_status": left.get("status"),
         "right_status": right.get("status"),
-        "left_minus_right": deltas,
+        "metrics": build_harvest_replay_delta_metrics(left, right),
     }
 
 
@@ -218,22 +162,38 @@ def portfolio_summary(
     return_metrics = return_summary(common_dates, portfolio_values, benchmark_values)
 
     feature_summary = portfolio_feature_summary(portfolio, weights, sectors, target_sectors, return_metrics)
-    return {
+    construction_metrics = metric_group(portfolio, "construction")
+    harvest_metrics = metric_group(portfolio, "harvest_replay")
+    comparison_context = {
+        "portfolio": portfolio,
+        "returns": return_metrics,
         "position_count": len(weights),
         "covered_price_weight": returns.covered_weight,
         "missing_price_tickers": returns.missing_tickers,
-        "ticker_overlap_with_index": len(set(weights).intersection(index_weights)),
         "weighted_overlap_with_index": weighted_overlap(weights, index_weights),
         "active_share_to_index": active_share(weights, index_weights),
-        "sector_weights": sectors,
-        "sector_abs_error_to_index": l1_distance(sectors, target_sectors),
         "sector_active_share_to_index": 0.5 * l1_distance(sectors, target_sectors),
         "sector_similarity_to_index": cosine_similarity(sectors, target_sectors),
         "sector_overlap_to_index": weighted_overlap(sectors, target_sectors),
+        "construction_tracking_error": _float_or_none(construction_metrics.get("tracking_error")),
+        "construction_beta": _float_or_none(construction_metrics.get("beta")),
+        "benchmark_tracking_error": _float_or_none(return_metrics.get("benchmark_tracking_error")),
+        "benchmark_beta": _float_or_none(return_metrics.get("benchmark_beta")),
+        "harvest_replay_metrics": harvest_metrics,
+        "effective_names": effective_count(weights.values()),
+        "max_weight": max(weights.values()) if weights else 0.0,
+        "sector_abs_error": l1_distance(sectors, target_sectors),
+        "error_margin": _float_or_none(_mapping(portfolio.get("targets")).get("error_margin")),
+    }
+    return {
+        "metrics": build_portfolio_comparison_metrics(comparison_context),
+        "ticker_overlap_with_index": len(set(weights).intersection(index_weights)),
+        "sector_weights": sectors,
+        "sector_abs_error_to_index": l1_distance(sectors, target_sectors),
         "effective_sector_count": effective_count(sectors.values()),
         "returns": return_metrics,
-        "features": feature_summary,
-        "objective_decomposition": objective_decomposition(portfolio, feature_summary),
+        "feature_vector": feature_summary,
+        "objective_decomposition": {"metrics": objective_decomposition(portfolio, feature_summary)},
     }
 
 
@@ -260,7 +220,7 @@ def pairwise_summary(
 
     left_factors = factor_exposures(left, left_values)
     right_factors = factor_exposures(right, right_values)
-    return {
+    pair_context = {
         "left": left_label,
         "right": right_label,
         "ticker_overlap_count": len(left_tickers.intersection(right_tickers)),
@@ -276,6 +236,12 @@ def pairwise_summary(
         "tax_lot_action_overlap": tax_lot_action_overlap(left, right),
         "returns": pair_return_summary(common_dates, left_values, right_values),
     }
+    return {
+        "left": left_label,
+        "right": right_label,
+        "metrics": build_pairwise_metrics(pair_context),
+        "returns": pair_context["returns"],
+    }
 
 
 
@@ -286,32 +252,26 @@ def portfolio_feature_summary(
     target_sectors: Mapping[str, float],
     return_metrics: Mapping[str, object],
 ) -> Dict[str, object]:
-    metrics = _mapping(portfolio.get("metrics"))
+    construction = metric_group(portfolio, "construction")
+    harvest = metric_group(portfolio, "harvest_replay")
     targets = _mapping(portfolio.get("targets"))
-    replay = _mapping(portfolio.get("portfolio_harvest_simulation"))
     features: Dict[str, object] = {
-        "tracking_error": _float_or_none(metrics.get("tracking_error"))
+        "tracking_error": _float_or_none(construction.get("tracking_error"))
         or _float_or_none(return_metrics.get("benchmark_tracking_error"))
         or 0.0,
-        "beta": _float_or_none(metrics.get("beta")) or _float_or_none(return_metrics.get("benchmark_beta")) or 0.0,
-        "tax_alpha": _float_or_none(metrics.get("tax_alpha")) or 0.0,
-        "simulated_tax_alpha": _float_or_none(metrics.get("portfolio_simulated_tax_alpha"))
-        or _float_or_none(metrics.get("simulated_tax_alpha"))
-        or 0.0,
-        "realized_loss_rate": _float_or_none(metrics.get("portfolio_realized_loss_rate"))
-        or _float_or_none(replay.get("portfolio_realized_loss_rate"))
-        or 0.0,
-        "turnover": _float_or_none(replay.get("total_transaction_cost"))
-        or _float_or_none(metrics.get("total_transaction_cost"))
-        or 0.0,
+        "beta": _float_or_none(construction.get("beta")) or _float_or_none(return_metrics.get("benchmark_beta")) or 0.0,
+        "tax_alpha": _float_or_none(construction.get("tax_alpha")) or 0.0,
+        "simulated_tax_alpha": _float_or_none(construction.get("simulated_tax_alpha")) or 0.0,
+        "realized_loss_rate": _float_or_none(harvest.get("portfolio_realized_loss_rate")) or 0.0,
+        "turnover": _float_or_none(harvest.get("total_transaction_cost")) or 0.0,
         "effective_names": effective_count(weights.values()),
         "max_weight": max(weights.values()) if weights else 0.0,
-        "active_share_to_index": _float_or_none(metrics.get("active_share")) or 0.0,
+        "active_share_to_index": _float_or_none(construction.get("active_share")) or 0.0,
         "sector_abs_error": l1_distance(sectors, target_sectors),
         "tracking_constraint_slack": max(
             (_float_or_none(targets.get("error_margin")) or 0.0)
             - (
-                _float_or_none(metrics.get("tracking_error"))
+                _float_or_none(construction.get("tracking_error"))
                 or _float_or_none(return_metrics.get("benchmark_tracking_error"))
                 or 0.0
             ),
@@ -325,19 +285,20 @@ def portfolio_feature_summary(
 
 
 def factor_exposures(portfolio: Mapping[str, object], returns: Sequence[float]) -> Dict[str, float]:
-    metrics = _mapping(portfolio.get("metrics"))
-    explicit = _mapping(metrics.get("factor_exposures")) or _mapping(portfolio.get("factor_exposures"))
+    construction = metric_group(portfolio, "construction")
+    harvest = metric_group(portfolio, "harvest_replay")
+    explicit = _mapping(construction.get("factor_exposures")) or _mapping(portfolio.get("factor_exposures"))
     if explicit:
         return {str(key): value for key, raw in explicit.items() if (value := _float_or_none(raw)) is not None}
     exposures = {}
-    for source_key, factor_key in (
-        ("beta", "beta"),
-        ("portfolio_harvest_beta", "harvest_beta"),
-        ("tracking_error", "tracking_error"),
-        ("portfolio_harvest_tracking_error", "harvest_tracking_error"),
-        ("effective_number_of_names", "effective_names"),
+    for source, source_key, factor_key in (
+        (construction, "beta", "beta"),
+        (harvest, "portfolio_harvest_beta", "harvest_beta"),
+        (construction, "tracking_error", "tracking_error"),
+        (harvest, "portfolio_harvest_tracking_error", "harvest_tracking_error"),
+        (construction, "effective_number_of_names", "effective_names"),
     ):
-        value = _float_or_none(metrics.get(source_key))
+        value = _float_or_none(source.get(source_key))
         if value is not None:
             exposures[factor_key] = value
     if returns:
@@ -372,39 +333,32 @@ def tax_lot_action_tickers(portfolio: Mapping[str, object]) -> set[str]:
 
 
 def objective_decomposition(portfolio: Mapping[str, object], features: Mapping[str, object]) -> Dict[str, float]:
-    replay = _mapping(portfolio.get("portfolio_harvest_simulation"))
+    harvest = metric_group(portfolio, "harvest_replay")
     targets = _mapping(portfolio.get("targets"))
-    target_tax = (
-        _float_or_none(targets.get("estimated_tax_loss_alpha"))
+    context = {
+        "target_tax_alpha": _float_or_none(targets.get("estimated_tax_loss_alpha"))
         or _float_or_none(targets.get("target_tax_alpha"))
-        or 0.0
-    )
-    tax_alpha = _float_or_none(features.get("tax_alpha")) or 0.0
-    tax_delta = tax_alpha - target_tax
-    if targets.get("tax_alpha_mode") == "at-least":
-        tax_delta = min(tax_delta, 0.0)
-    error_margin = max(_float_or_none(targets.get("error_margin")) or 0.005, 0.005)
-    tracking = _float_or_none(features.get("tracking_error")) or 0.0
-    sector = _float_or_none(features.get("sector_abs_error")) or 0.0
-    max_weight = _float_or_none(features.get("max_weight")) or 0.0
-    cash = abs(1.0 - sum(position_weights(portfolio).values()))
-    return {
-        "tracking_error_penalty": tracking / error_margin if error_margin else 0.0,
-        "sector_penalty": sector,
-        "factor_penalty": abs((_float_or_none(features.get("beta")) or 1.0) - 1.0),
-        "concentration_penalty": max_weight,
-        "transaction_cost": _float_or_none(replay.get("total_transaction_cost")) or 0.0,
-        "tax_benefit": -abs(tax_delta),
-        "wash_sale_penalty": float(_float_or_none(replay.get("skipped_constraint_violation")) or 0.0)
-        + float(_float_or_none(replay.get("skipped_no_replacement")) or 0.0),
-        "cash_penalty": cash,
+        or 0.0,
+        "tax_alpha_mode": targets.get("tax_alpha_mode"),
+        "error_margin": _float_or_none(targets.get("error_margin")) or 0.005,
+        "tracking_error": _float_or_none(features.get("tracking_error")) or 0.0,
+        "sector_abs_error": _float_or_none(features.get("sector_abs_error")) or 0.0,
+        "beta": _float_or_none(features.get("beta")) or 1.0,
+        "max_weight": _float_or_none(features.get("max_weight")) or 0.0,
+        "tax_alpha": _float_or_none(features.get("tax_alpha")) or 0.0,
+        "total_transaction_cost": _float_or_none(harvest.get("total_transaction_cost")) or 0.0,
+        "skipped_constraint_violation": _float_or_none(harvest.get("skipped_constraint_violation")) or 0.0,
+        "skipped_no_replacement": _float_or_none(harvest.get("skipped_no_replacement")) or 0.0,
+        "cash_penalty": abs(1.0 - sum(position_weights(portfolio).values())),
     }
+    return {key: float(value) for key, value in build_objective_metrics(context).items() if isinstance(value, (int, float))}
 
 
 def _mapping(value: object) -> Mapping[str, object]:
     if isinstance(value, Mapping):
         return cast(Mapping[str, object], value)
     return {}
+
 
 def position_weights(portfolio: Mapping[str, object]) -> Dict[str, float]:
     positions = portfolio.get("positions", [])

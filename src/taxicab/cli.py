@@ -29,6 +29,14 @@ from .data import (
     write_json,
 )
 from .metrics import FREQUENCIES, daily_returns
+from .metric_registry import (
+    build_harvest_replay_metrics,
+    comparison_cli_metrics,
+    construct_cli_metrics,
+    format_metric_value,
+    metric_group,
+    require_schema_version,
+)
 from .optimizer import (
     build_candidates,
     construct_portfolio,
@@ -606,33 +614,11 @@ def attach_portfolio_context(
                 raise ValueError(
                     "harvest replay violates hard benchmark-fidelity constraints: "
                     + "; ".join(replay_violations)
-                )
+        )
         portfolio["portfolio_harvest_simulation"] = simulation
         metrics = portfolio.setdefault("metrics", {})
-        metrics["portfolio_simulated_tax_alpha"] = simulation["portfolio_simulated_tax_alpha"]
-        metrics["portfolio_realized_loss_rate"] = simulation["portfolio_realized_loss_rate"]
-        metrics["portfolio_annual_realized_loss"] = simulation["annual_realized_loss"]
-        metrics["portfolio_total_realized_loss"] = simulation["total_realized_loss"]
-        metrics["portfolio_harvest_count"] = simulation["harvest_count"]
-        metrics["portfolio_rebalance_count"] = simulation["rebalance_count"]
-        metrics["portfolio_harvest_annualized_return"] = simulation["portfolio_harvest_annualized_return"]
-        metrics["benchmark_annualized_return"] = simulation["benchmark_annualized_return"]
-        metrics["portfolio_harvest_active_return"] = simulation["portfolio_harvest_active_return"]
-        metrics["portfolio_harvest_tracking_error"] = simulation["portfolio_harvest_tracking_error"]
-        metrics["portfolio_harvest_tracking_error_annualized_pct"] = simulation[
-            "portfolio_harvest_tracking_error_annualized_pct"
-        ]
-        metrics["portfolio_harvest_beta"] = simulation["portfolio_harvest_beta"]
-        metrics["portfolio_harvest_correlation"] = simulation["portfolio_harvest_correlation"]
-        metrics["portfolio_harvest_observations"] = simulation["portfolio_harvest_observations"]
-        metrics["realized_loss_rate_pct_per_year"] = simulation["realized_loss_rate_pct_per_year"]
-        metrics["immediate_tax_savings_pct_per_year"] = simulation["immediate_tax_savings_pct_per_year"]
-        metrics["immediate_net_tax_savings_pct_per_year"] = simulation["immediate_net_tax_savings_pct_per_year"]
-        metrics["simulated_after_tax_alpha_pct_per_year"] = simulation["simulated_after_tax_alpha_pct_per_year"]
-        metrics["full_liquidation_after_tax_alpha_pct_per_year"] = simulation[
-            "full_liquidation_after_tax_alpha_pct_per_year"
-        ]
-        metrics["terminal_after_tax_wealth_difference_pct"] = simulation["terminal_after_tax_wealth_difference_pct"]
+        if isinstance(metrics, dict):
+            cast(Dict[str, object], metrics)["harvest_replay"] = build_harvest_replay_metrics(simulation)
     portfolio["source_cache"] = {
         "data_dir": str(Path(data_dir).resolve()),
         "metadata": metadata,
@@ -686,105 +672,41 @@ def write_json_with_parents(data: object, path: str | Path) -> None:
     write_json(data, target)
 
 
+def _format_metric_pairs(values: Mapping[str, object], specs) -> List[str]:
+    pairs = []
+    for spec in specs:
+        if spec.key in values:
+            pairs.append(f"{spec.key}={format_metric_value(values.get(spec.key), spec)}")
+    return pairs
+
+
 def print_construct_summary(portfolio, *, sector_match: bool) -> None:
-    metrics = portfolio["metrics"]
-    tracking_error_pct = float(metrics.get("tracking_error_annualized_pct", metrics.get("error_percentage", 0.0)))
-    simulated_alpha_pct = float(
-        metrics.get(
-            "simulated_after_tax_alpha_pct_per_year",
-            float(metrics["simulated_tax_alpha"]) * 100.0,
-        )
-    )
-    gross_loss_pct = float(
-        metrics.get(
-            "gross_harvestable_loss_rate_pct_per_year",
-            float(metrics["gross_harvestable_loss_rate"]) * 100.0,
-        )
-    )
-    print(
-        (
-            "Portfolio beta={:.4f}, tracking_error_annualized_pct={:.2f}%, "
-            "tax_alpha_pct_per_year={:.2f}%, "
-            "simulated_after_tax_alpha_pct_per_year={:.2f}%, "
-            "gross_harvestable_loss_rate_pct_per_year={:.2f}%"
-        ).format(
-            float(metrics["beta"]),
-            tracking_error_pct,
-            float(metrics["tax_alpha"]) * 100.0,
-            simulated_alpha_pct,
-            gross_loss_pct,
-        )
-    )
-    if "tracking_error" in metrics:
-        active_share_pct = float(metrics.get("active_share_pct", float(metrics.get("active_share", 0.0)) * 100.0))
-        max_weight_pct = float(metrics.get("max_weight_pct", float(metrics.get("max_weight", 0.0)) * 100.0))
-        print(
-            (
-                "tracking_error_annualized_pct={:.2f}%, active_share_pct={:.2f}%, "
-                "max_weight_pct={:.2f}%, effective_names={:.1f}"
-            ).format(
-                float(metrics.get("tracking_error_annualized_pct", float(metrics["tracking_error"]) * 100.0)),
-                active_share_pct,
-                max_weight_pct,
-                float(metrics.get("effective_number_of_names", 0.0)),
-            )
-        )
-    if "portfolio_simulated_tax_alpha" in metrics:
-        replay_alpha_pct = float(
-            metrics.get(
-                "simulated_after_tax_alpha_pct_per_year",
-                float(metrics["portfolio_simulated_tax_alpha"]) * 100.0,
-            )
-        )
-        realized_loss_pct = float(
-            metrics.get(
-                "realized_loss_rate_pct_per_year",
-                float(metrics["portfolio_realized_loss_rate"]) * 100.0,
-            )
-        )
-        print(
-            (
-                "simulated_after_tax_alpha_pct_per_year={:.2f}%, "
-                "realized_loss_rate_pct_per_year={:.2f}%, "
-                "immediate_tax_savings_pct_per_year={:.2f}%, harvests={}, rebalances={}"
-            ).format(
-                replay_alpha_pct,
-                realized_loss_pct,
-                float(metrics.get("immediate_tax_savings_pct_per_year", 0.0)),
-                int(metrics["portfolio_harvest_count"]),
-                int(metrics.get("portfolio_rebalance_count", 0)),
-            )
-        )
-    if "portfolio_harvest_tracking_error" in metrics:
-        harvest_tracking_error_pct = float(
-            metrics.get(
-                "portfolio_harvest_tracking_error_annualized_pct",
-                float(metrics["portfolio_harvest_tracking_error"]) * 100.0,
-            )
-        )
-        print(
-            (
-                "harvest_path_tracking_error_annualized_pct={:.2f}%, "
-                "harvest_path_active_return_pct_per_year={:.2f}%, beta={:.4f}, "
-                "correlation={:.4f}"
-            ).format(
-                harvest_tracking_error_pct,
-                float(metrics["portfolio_harvest_active_return"]) * 100.0,
-                float(metrics["portfolio_harvest_beta"]),
-                float(metrics["portfolio_harvest_correlation"]),
-            )
-        )
+    construction = metric_group(portfolio, "construction")
+    harvest = metric_group(portfolio, "harvest_replay")
+    constraints = metric_group(portfolio, "constraints")
+
+    primary = _format_metric_pairs(construction, construct_cli_metrics("construct_cli_primary"))
+    if primary:
+        print("Portfolio " + ", ".join(primary))
+
+    fit = _format_metric_pairs(construction, construct_cli_metrics("construct_cli_fit"))
+    if fit:
+        print(", ".join(fit))
+
+    replay = _format_metric_pairs(harvest, construct_cli_metrics("construct_cli_harvest"))
+    if replay:
+        print(", ".join(replay))
+
+    path = _format_metric_pairs(harvest, construct_cli_metrics("construct_cli_path"))
+    if path:
+        print(", ".join(path))
+
     if sector_match:
-        sector_error_pct = float(
-            metrics.get(
-                "sector_absolute_error_pct",
-                float(metrics.get("sector_abs_error", 0.0)) * 100.0,
-            )
-        )
-        print(
-            "sector_absolute_error_pct={:.2f}%".format(sector_error_pct)
-        )
-    warnings = metrics.get("constraint_warnings")
+        sector = _format_metric_pairs(construction, construct_cli_metrics("construct_cli_sector"))
+        if sector:
+            print(", ".join(sector))
+
+    warnings = constraints.get("constraint_warnings")
     if isinstance(warnings, list) and warnings:
         print("Constraint warnings: {}".format(", ".join(str(item) for item in warnings)))
 
@@ -838,6 +760,7 @@ def command_compare(args: argparse.Namespace) -> int:
         state = read_json(path)
         if not isinstance(state, dict):
             raise ValueError(f"{path} must contain a portfolio JSON object")
+        require_schema_version(cast(Mapping[str, object], state), "portfolio")
         portfolios[label] = cast(Dict[str, object], state)
         sources[label] = str(path)
 
@@ -1022,92 +945,31 @@ def print_comparison_summary(comparison) -> None:
         for label, summary in portfolios.items():
             if not isinstance(summary, dict):
                 continue
-            returns = summary.get("returns", {})
-            if not isinstance(returns, dict):
-                returns = {}
-            print(
-                (
-                    "{}: annualized return={}, tracking error={}, beta={}, "
-                    "sector active share={}, sector similarity={}, active share={}"
-                ).format(
-                    label,
-                    format_pct(returns.get("annualized_return")),
-                    format_pct(returns.get("benchmark_tracking_error")),
-                    format_number(returns.get("benchmark_beta")),
-                    format_pct(summary.get("sector_active_share_to_index")),
-                    format_number(summary.get("sector_similarity_to_index")),
-                    format_pct(summary.get("active_share_to_index")),
-                )
-            )
+            metrics = _mapping_or_empty(summary.get("metrics"))
+            portfolio_parts = _format_metric_pairs(metrics, comparison_cli_metrics("comparison_cli_portfolio"))
+            if portfolio_parts:
+                print(f"{label}: " + ", ".join(portfolio_parts))
             replay = summary.get("harvest_replay")
             if isinstance(replay, dict):
-                print(
-                    (
-                        "{} harvest replay: simulated tax alpha={}, realized loss={}, "
-                        "active return={}, tracking error={}, harvests={}, rebalances={}"
-                    ).format(
-                        label,
-                        format_pct(replay.get("portfolio_simulated_tax_alpha")),
-                        format_pct(replay.get("portfolio_realized_loss_rate")),
-                        format_pct(replay.get("portfolio_harvest_active_return")),
-                        format_pct(replay.get("portfolio_harvest_tracking_error")),
-                        replay.get("harvest_count", "n/a"),
-                        replay.get("rebalance_count", "n/a"),
-                    )
-                )
+                replay_metrics = _mapping_or_empty(replay.get("metrics"))
+                replay_parts = _format_metric_pairs(replay_metrics, comparison_cli_metrics("comparison_cli_harvest"))
+                if replay_parts:
+                    print(f"{label} harvest replay: " + ", ".join(replay_parts))
     pairs = comparison.get("pairwise", [])
     if isinstance(pairs, list):
         for pair in pairs:
             if not isinstance(pair, dict):
                 continue
-            returns = pair.get("returns", {})
-            if not isinstance(returns, dict):
-                returns = {}
-            print(
-                (
-                    "{} vs {}: ticker overlap={}, weighted overlap={}, "
-                    "sector distance={}, return correlation={}, pair tracking error={}"
-                ).format(
-                    pair.get("left"),
-                    pair.get("right"),
-                    pair.get("ticker_overlap_count"),
-                    format_pct(pair.get("weighted_overlap")),
-                    format_pct(pair.get("sector_abs_distance")),
-                    format_number(returns.get("correlation")),
-                    format_pct(returns.get("tracking_error")),
-                )
-            )
-            replay = pair.get("harvest_replay_deltas")
+            pair_metrics = _mapping_or_empty(pair.get("metrics"))
+            pair_parts = _format_metric_pairs(pair_metrics, comparison_cli_metrics("comparison_cli_pairwise"))
+            if pair_parts:
+                print(f"{pair.get('left')} vs {pair.get('right')}: " + ", ".join(pair_parts))
+            replay = pair.get("harvest_replay_delta")
             if isinstance(replay, dict):
-                deltas = replay.get("left_minus_right", {})
-                if isinstance(deltas, dict):
-                    print(
-                        (
-                            "{} vs {} harvest replay delta: simulated tax alpha={}, "
-                            "realized loss={}, active return={}, terminal after-tax wealth={}"
-                        ).format(
-                            pair.get("left"),
-                            pair.get("right"),
-                            format_pct(deltas.get("portfolio_simulated_tax_alpha")),
-                            format_pct(deltas.get("portfolio_realized_loss_rate")),
-                            format_pct(deltas.get("portfolio_harvest_active_return")),
-                            format_pct(deltas.get("terminal_after_tax_wealth_difference")),
-                        )
-                    )
-
-
-def format_pct(value: object) -> str:
-    number = _float_or_none(value)
-    if number is None:
-        return "n/a"
-    return "{:.2f}%".format(number * 100.0)
-
-
-def format_number(value: object) -> str:
-    number = _float_or_none(value)
-    if number is None:
-        return "n/a"
-    return "{:.4f}".format(number)
+                deltas = _mapping_or_empty(replay.get("metrics"))
+                delta_parts = _format_metric_pairs(deltas, comparison_cli_metrics("comparison_cli_delta"))
+                if delta_parts:
+                    print(f"{pair.get('left')} vs {pair.get('right')} harvest replay delta: " + ", ".join(delta_parts))
 
 
 def _float_or_none(value: object) -> Optional[float]:
@@ -1123,6 +985,7 @@ def command_rebalance(args: argparse.Namespace) -> int:
     state = read_json(args.state)
     if not isinstance(state, dict):
         raise ValueError("state JSON must contain an object")
+    require_schema_version(cast(Mapping[str, object], state), "portfolio")
     state = cast(Dict[str, object], state)
     current = read_current_positions(args.current_csv)
     operations = plan_rebalance(

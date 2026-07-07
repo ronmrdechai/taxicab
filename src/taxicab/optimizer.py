@@ -7,7 +7,7 @@ import random
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, cast
 
 import numpy as np
 from scipy.optimize import minimize
@@ -22,6 +22,12 @@ from .metrics import (
     period_end_points,
     simulated_realized_loss_rate,
     simulated_tax_alpha,
+)
+from .metric_registry import (
+    OUTPUT_SCHEMA_VERSION,
+    build_construction_metrics,
+    build_constraint_metrics,
+    build_selection_metrics,
 )
 
 
@@ -363,9 +369,8 @@ def portfolio_metrics(
     if tracking_model:
         tracking_error_value = tracking_error(weights, tracking_model)
         metrics["tracking_error"] = tracking_error_value
-        metrics["error_percentage"] = tracking_error_value * 100.0
         metrics["tracking_error_observations"] = tracking_model.observations
-    return metrics
+    return build_construction_metrics(metrics)
 
 
 def project_to_simplex(values: Sequence[float]) -> List[float]:
@@ -959,8 +964,8 @@ def random_unbiased_selection(
         selected.extend(sector_selection.selected)
         weights.extend(sector_selection.weights)
         inclusion_probabilities.update(sector_selection.inclusion_probabilities)
-        certainty_count += int(sector_selection.diagnostics["random_unbiased_certainty_count"])
-        random_count += int(sector_selection.diagnostics["random_unbiased_random_count"])
+        certainty_count += int(cast(int, sector_selection.diagnostics["random_unbiased_certainty_count"]))
+        random_count += int(cast(int, sector_selection.diagnostics["random_unbiased_random_count"]))
 
     if len(selected) != sample_size:
         raise ValueError(
@@ -1801,36 +1806,6 @@ def sector_error(sectors: Dict[str, float], targets: Dict[str, float]) -> float:
     return sum(abs(sectors.get(sector, 0.0) - targets.get(sector, 0.0)) for sector in set(sectors).union(targets))
 
 
-def _object_to_float(value: object) -> Optional[float]:
-    if not isinstance(value, (int, float, str)):
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _add_percent_metric_aliases(metrics: Dict[str, object]) -> None:
-    tracking_error_value = _object_to_float(metrics.get("tracking_error"))
-    if tracking_error_value is not None:
-        metrics["tracking_error_annualized_pct"] = tracking_error_value * 100.0
-    active_share_value = _object_to_float(metrics.get("active_share"))
-    if active_share_value is not None:
-        metrics["active_share_pct"] = active_share_value * 100.0
-    max_weight_value = _object_to_float(metrics.get("max_weight"))
-    if max_weight_value is not None:
-        metrics["max_weight_pct"] = max_weight_value * 100.0
-    sector_abs_error_value = _object_to_float(metrics.get("sector_abs_error"))
-    if sector_abs_error_value is not None:
-        metrics["sector_absolute_error_pct"] = sector_abs_error_value * 100.0
-    gross_loss_value = _object_to_float(metrics.get("gross_harvestable_loss_rate"))
-    if gross_loss_value is not None:
-        metrics["gross_harvestable_loss_rate_pct_per_year"] = gross_loss_value * 100.0
-    simulated_tax_alpha_value = _object_to_float(metrics.get("simulated_tax_alpha"))
-    if simulated_tax_alpha_value is not None:
-        metrics["simulated_after_tax_alpha_pct_per_year"] = simulated_tax_alpha_value * 100.0
-
-
 def _constraint_warnings(metrics: Mapping[str, object], sample_size: int) -> List[str]:
     warnings: List[str] = []
 
@@ -2060,9 +2035,7 @@ def _empty_harvest_simulation(
         "portfolio_harvest_annualized_return": 0.0,
         "benchmark_annualized_return": 0.0,
         "portfolio_harvest_active_return": 0.0,
-        "portfolio_harvest_active_return_pct_per_year": 0.0,
         "portfolio_harvest_tracking_error": 0.0,
-        "portfolio_harvest_tracking_error_annualized_pct": 0.0,
         "portfolio_harvest_beta": 0.0,
         "portfolio_harvest_correlation": 0.0,
         "portfolio_harvest_observations": 0,
@@ -2076,12 +2049,10 @@ def _empty_harvest_simulation(
         "harvest_diagnostics": [],
         "skipped_harvest_events": [],
         "cash_drag": 0.0,
-        "immediate_tax_savings_pct_per_year": 0.0,
-        "immediate_net_tax_savings_pct_per_year": 0.0,
-        "realized_loss_rate_pct_per_year": 0.0,
-        "simulated_after_tax_alpha_pct_per_year": 0.0,
-        "full_liquidation_after_tax_alpha_pct_per_year": 0.0,
-        "terminal_after_tax_wealth_difference_pct": 0.0,
+        "immediate_tax_savings_rate": 0.0,
+        "immediate_net_tax_savings_rate": 0.0,
+        "full_liquidation_after_tax_alpha": 0.0,
+        "terminal_after_tax_wealth_difference": 0.0,
         "period_realized_losses": [],
         "sample_events": [],
     }
@@ -2225,15 +2196,11 @@ def _replay_snapshot_from_values(
         "cash_weight": 0.0,
         "missing_candidate_weight": missing_weight,
         "tracking_error": tracking_error_value,
-        "tracking_error_annualized_pct": tracking_error_value * 100.0,
         "beta": beta,
         "active_share": active_share_value,
-        "active_share_pct": active_share_value * 100.0,
         "max_weight": max_weight,
-        "max_weight_pct": max_weight * 100.0,
         "effective_names": effective_names,
         "sector_abs_error": sector_abs_error,
-        "sector_absolute_error_pct": sector_abs_error * 100.0,
         "position_count": len(weight_by_ticker),
         "weights": weight_by_ticker,
         "sectors": sectors,
@@ -2517,9 +2484,7 @@ def _harvest_path_metrics(
         "portfolio_harvest_annualized_return": _annualized_return(portfolio_values, years),
         "benchmark_annualized_return": _annualized_return(benchmark_values, years),
         "portfolio_harvest_active_return": active_return_value,
-        "portfolio_harvest_active_return_pct_per_year": active_return_value * 100.0,
         "portfolio_harvest_tracking_error": tracking_error_value,
-        "portfolio_harvest_tracking_error_annualized_pct": tracking_error_value * 100.0,
         "portfolio_harvest_beta": covariance / benchmark_variance if benchmark_variance > 0 else 0.0,
         "portfolio_harvest_correlation": covariance / correlation_denominator if correlation_denominator > 0 else 0.0,
         "portfolio_harvest_observations": observation_count,
@@ -3375,12 +3340,10 @@ def simulate_portfolio_harvests(
         "total_net_tax_benefit": total_net_tax_benefit,
         "full_liquidation_after_tax_benefit": full_liquidation_after_tax_benefit,
         "portfolio_simulated_tax_alpha": portfolio_simulated_tax_alpha,
-        "realized_loss_rate_pct_per_year": portfolio_realized_loss_rate * 100.0,
-        "immediate_tax_savings_pct_per_year": immediate_tax_savings_rate * 100.0,
-        "immediate_net_tax_savings_pct_per_year": immediate_net_tax_savings_rate * 100.0,
-        "simulated_after_tax_alpha_pct_per_year": portfolio_simulated_tax_alpha * 100.0,
-        "full_liquidation_after_tax_alpha_pct_per_year": portfolio_simulated_tax_alpha * 100.0,
-        "terminal_after_tax_wealth_difference_pct": terminal_after_tax_wealth_difference * 100.0,
+        "immediate_tax_savings_rate": immediate_tax_savings_rate,
+        "immediate_net_tax_savings_rate": immediate_net_tax_savings_rate,
+        "full_liquidation_after_tax_alpha": portfolio_simulated_tax_alpha,
+        "terminal_after_tax_wealth_difference": terminal_after_tax_wealth_difference,
         "cash_drag": 0.0,
         **path_metrics,
         "harvest_count": harvest_count,
@@ -3601,27 +3564,26 @@ def construct_portfolio(
     else:
         weights = index_weighted_weights(selected, min_weight=min_weight, max_weight=max_weight)
     tracking_model = prepare_tracking_model(selected, construction_benchmark_returns)
-    metrics = portfolio_metrics(selected, weights, tracking_model=tracking_model)
-    metrics.update(selection_diagnostics)
+    construction_metrics = portfolio_metrics(selected, weights, tracking_model=tracking_model)
     price_tracking_model = prepare_tracking_model(selected, benchmark_returns)
     if price_tracking_model is not None:
-        metrics["price_benchmark_tracking_error"] = tracking_error(weights, price_tracking_model)
-        metrics["price_benchmark_tracking_error_annualized_pct"] = (
-            float(metrics["price_benchmark_tracking_error"]) * 100.0
-        )
-    metrics["active_share"] = active_share(selected, weights, holdings)
+        construction_metrics["price_benchmark_tracking_error"] = tracking_error(weights, price_tracking_model)
+    construction_metrics["active_share"] = active_share(selected, weights, holdings)
     sector_targets_out = targets or {}
     if sector_targets_out:
-        metrics["sector_abs_error"] = sector_error(_sector_vector(selected, weights), sector_targets_out)
-    _add_percent_metric_aliases(metrics)
-    metrics["constraint_warnings"] = _constraint_warnings(metrics, sample_size)
-    hard_violations = _hard_constraint_violations(metrics, selected, weights, sample_size)
-    metrics["constraint_violations"] = hard_violations
+        construction_metrics["sector_abs_error"] = sector_error(_sector_vector(selected, weights), sector_targets_out)
+    constraint_warnings = _constraint_warnings(construction_metrics, sample_size)
+    hard_violations = _hard_constraint_violations(construction_metrics, selected, weights, sample_size)
     if hard_violations and not allow_constraint_violations:
         raise ValueError(
             "constructed portfolio violates hard benchmark-fidelity constraints: "
             + "; ".join(hard_violations)
         )
+    metrics = {
+        "construction": construction_metrics,
+        "selection": build_selection_metrics(selection_diagnostics),
+        "constraints": build_constraint_metrics(constraint_warnings, hard_violations),
+    }
 
     positions = []
     for candidate, weight in sorted(zip(selected, weights), key=lambda item: item[1], reverse=True):
@@ -3647,7 +3609,7 @@ def construct_portfolio(
         )
 
     return {
-        "version": 1,
+        "version": OUTPUT_SCHEMA_VERSION,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "targets": {
             "sample_size": sample_size,
