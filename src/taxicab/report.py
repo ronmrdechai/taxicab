@@ -14,11 +14,11 @@ class ComparisonMetric:
     label: str
     path: Sequence[str]
     group: str
+    description: str
     value_format: str = "number"
     better: str = "neutral"
     target: Optional[float] = None
     full_intensity_at: Optional[float] = None
-    description: str = ""
 
 
 @dataclass(frozen=True)
@@ -36,6 +36,7 @@ PORTFOLIO_METRICS: Sequence[ComparisonMetric] = (
         "Annualized return",
         ("returns", "annualized_return"),
         "Performance",
+        "Annualized portfolio return over the comparison price window. Higher values rank better in this report.",
         "pct",
         better="higher",
         full_intensity_at=0.05,
@@ -45,6 +46,7 @@ PORTFOLIO_METRICS: Sequence[ComparisonMetric] = (
         "Active return vs benchmark",
         ("returns", "benchmark_annualized_active_return"),
         "Performance",
+        "Portfolio annualized return minus benchmark annualized return over the comparison window. Higher values rank better.",
         "pct",
         better="higher",
         full_intensity_at=0.03,
@@ -54,6 +56,7 @@ PORTFOLIO_METRICS: Sequence[ComparisonMetric] = (
         "Cumulative return",
         ("returns", "cumulative_return"),
         "Performance",
+        "Total compounded portfolio return over the comparison price window. Higher values rank better.",
         "pct",
         better="higher",
         full_intensity_at=0.20,
@@ -63,17 +66,18 @@ PORTFOLIO_METRICS: Sequence[ComparisonMetric] = (
         "Max drawdown",
         ("returns", "max_drawdown"),
         "Performance",
+        "Largest peak-to-trough decline over the comparison window. Values closer to zero rank better.",
         "pct",
         better="target",
         target=0.0,
         full_intensity_at=0.10,
-        description="Closer to zero is better.",
     ),
     ComparisonMetric(
         "benchmark_tracking_error",
         "Tracking error vs benchmark",
         ("returns", "benchmark_tracking_error"),
         "Benchmark fit",
+        "Annualized volatility of active returns versus the benchmark. Lower values indicate a closer benchmark fit.",
         "pct",
         better="lower",
         full_intensity_at=0.03,
@@ -83,17 +87,18 @@ PORTFOLIO_METRICS: Sequence[ComparisonMetric] = (
         "Beta vs benchmark",
         ("returns", "benchmark_beta"),
         "Benchmark fit",
+        "Regression beta of portfolio returns against benchmark returns. Values closer to 1.0 rank better.",
         "number",
         better="target",
         target=1.0,
         full_intensity_at=0.10,
-        description="Closer to 1.0 is better.",
     ),
     ComparisonMetric(
         "active_share_to_index",
         "Active share to index",
         ("active_share_to_index",),
         "Benchmark fit",
+        "Weighted difference between portfolio holdings and index holdings. Lower values indicate a closer benchmark fit.",
         "pct",
         better="lower",
         full_intensity_at=0.15,
@@ -103,6 +108,7 @@ PORTFOLIO_METRICS: Sequence[ComparisonMetric] = (
         "Weighted overlap with index",
         ("weighted_overlap_with_index",),
         "Benchmark fit",
+        "Share of portfolio weight overlapping index holdings after ticker matching. Higher values indicate a closer benchmark fit.",
         "pct",
         better="higher",
         full_intensity_at=0.15,
@@ -112,16 +118,17 @@ PORTFOLIO_METRICS: Sequence[ComparisonMetric] = (
         "Estimated tax alpha",
         ("features", "simulated_tax_alpha"),
         "Tax metrics",
+        "Construction-time simulated tax-alpha estimate from optimizer inputs. This is a diagnostic, not tax or investment advice.",
         "pct",
         better="higher",
         full_intensity_at=0.02,
-        description="Construction-time optimizer estimate, distinct from harvest replay results.",
     ),
     ComparisonMetric(
         "sector_active_share_to_index",
         "Sector active share",
         ("sector_active_share_to_index",),
         "Sector fit",
+        "Total absolute difference between portfolio sector weights and index sector weights. Lower values indicate closer sector matching.",
         "pct",
         better="lower",
         full_intensity_at=0.05,
@@ -131,6 +138,7 @@ PORTFOLIO_METRICS: Sequence[ComparisonMetric] = (
         "Sector similarity",
         ("sector_similarity_to_index",),
         "Sector fit",
+        "Similarity score between portfolio sector weights and index sector weights. Higher values indicate closer sector matching.",
         "number",
         better="higher",
         full_intensity_at=0.05,
@@ -140,6 +148,7 @@ PORTFOLIO_METRICS: Sequence[ComparisonMetric] = (
         "Sector overlap with index",
         ("sector_overlap_to_index",),
         "Sector fit",
+        "Sector-weight overlap between the portfolio and index. Higher values indicate closer sector matching.",
         "pct",
         better="higher",
         full_intensity_at=0.05,
@@ -149,6 +158,7 @@ PORTFOLIO_METRICS: Sequence[ComparisonMetric] = (
         "Covered price weight",
         ("covered_price_weight",),
         "Data quality",
+        "Share of portfolio weight with usable price history in the comparison window. Higher values indicate better data coverage.",
         "pct",
         better="higher",
         full_intensity_at=0.05,
@@ -158,6 +168,7 @@ PORTFOLIO_METRICS: Sequence[ComparisonMetric] = (
         "Missing price tickers",
         ("missing_price_tickers",),
         "Data quality",
+        "Tickers missing usable price history for this comparison. Fewer missing tickers rank better.",
         "list",
         better="lower_length",
         full_intensity_at=5.0,
@@ -167,6 +178,7 @@ PORTFOLIO_METRICS: Sequence[ComparisonMetric] = (
         "Position count",
         ("position_count",),
         "Data quality",
+        "Number of portfolio positions included in the comparison summary.",
         "integer",
     ),
 )
@@ -178,6 +190,7 @@ HARVEST_REPLAY_METRICS: Sequence[ComparisonMetric] = (
         "Simulated tax alpha",
         ("harvest_replay", "portfolio_simulated_tax_alpha"),
         "Harvest replay",
+        "Harvest replay simulated annual tax-alpha diagnostic from the input assumptions. This is not tax advice.",
         "pct",
         better="higher",
         full_intensity_at=0.02,
@@ -187,6 +200,7 @@ HARVEST_REPLAY_METRICS: Sequence[ComparisonMetric] = (
         "Realized loss rate",
         ("harvest_replay", "portfolio_realized_loss_rate"),
         "Harvest replay",
+        "Annualized realized loss rate produced by the harvest replay assumptions. Higher values rank better as a diagnostic.",
         "pct",
         better="higher",
         full_intensity_at=0.02,
@@ -196,6 +210,7 @@ HARVEST_REPLAY_METRICS: Sequence[ComparisonMetric] = (
         "Harvest active return",
         ("harvest_replay", "portfolio_harvest_active_return"),
         "Harvest replay",
+        "Annualized active return of the harvest replay portfolio versus the benchmark. Higher values rank better.",
         "pct",
         better="higher",
         full_intensity_at=0.03,
@@ -205,6 +220,7 @@ HARVEST_REPLAY_METRICS: Sequence[ComparisonMetric] = (
         "Harvest tracking error",
         ("harvest_replay", "portfolio_harvest_tracking_error"),
         "Harvest replay",
+        "Annualized tracking error from the harvest replay path. Lower values indicate closer benchmark tracking.",
         "pct",
         better="lower",
         full_intensity_at=0.03,
@@ -214,6 +230,7 @@ HARVEST_REPLAY_METRICS: Sequence[ComparisonMetric] = (
         "Harvest beta",
         ("harvest_replay", "portfolio_harvest_beta"),
         "Harvest replay",
+        "Harvest replay beta versus the benchmark. Values closer to 1.0 rank better.",
         "number",
         better="target",
         target=1.0,
@@ -224,6 +241,7 @@ HARVEST_REPLAY_METRICS: Sequence[ComparisonMetric] = (
         "Total net tax benefit",
         ("harvest_replay", "total_net_tax_benefit"),
         "Harvest replay",
+        "Net simulated tax benefit accumulated during harvest replay under the input assumptions. This is not tax advice.",
         "number",
         better="higher",
         full_intensity_at=0.05,
@@ -233,6 +251,7 @@ HARVEST_REPLAY_METRICS: Sequence[ComparisonMetric] = (
         "Terminal after-tax wealth difference",
         ("harvest_replay", "terminal_after_tax_wealth_difference"),
         "Harvest replay",
+        "Replay terminal after-tax wealth difference versus the comparison baseline. Higher values rank better as a diagnostic.",
         "pct",
         better="higher",
         full_intensity_at=0.05,
@@ -242,6 +261,7 @@ HARVEST_REPLAY_METRICS: Sequence[ComparisonMetric] = (
         "Total transaction cost",
         ("harvest_replay", "total_transaction_cost"),
         "Harvest replay",
+        "Total replay transaction cost under the configured assumptions. Lower values rank better.",
         "number",
         better="lower",
         full_intensity_at=0.02,
@@ -251,6 +271,7 @@ HARVEST_REPLAY_METRICS: Sequence[ComparisonMetric] = (
         "Total replacement cost",
         ("harvest_replay", "total_replacement_cost"),
         "Harvest replay",
+        "Total replay replacement-trade cost under the configured assumptions. Lower values rank better.",
         "number",
         better="lower",
         full_intensity_at=0.02,
@@ -260,6 +281,7 @@ HARVEST_REPLAY_METRICS: Sequence[ComparisonMetric] = (
         "Harvest count",
         ("harvest_replay", "harvest_count"),
         "Harvest replay",
+        "Number of harvest trades executed by the replay model.",
         "integer",
     ),
     ComparisonMetric(
@@ -267,6 +289,7 @@ HARVEST_REPLAY_METRICS: Sequence[ComparisonMetric] = (
         "Rebalance count",
         ("harvest_replay", "rebalance_count"),
         "Harvest replay",
+        "Number of rebalances executed by the replay model.",
         "integer",
     ),
 )
@@ -278,6 +301,7 @@ PAIRWISE_METRICS: Sequence[ComparisonMetric] = (
         "Ticker overlap",
         ("ticker_overlap_count",),
         "Pairwise",
+        "Number of tickers shared by both portfolios in the pair.",
         "integer",
     ),
     ComparisonMetric(
@@ -285,6 +309,7 @@ PAIRWISE_METRICS: Sequence[ComparisonMetric] = (
         "Weighted overlap",
         ("weighted_overlap",),
         "Pairwise",
+        "Sum of overlapping weights between the row and column portfolios. Higher values indicate more similar holdings.",
         "pct",
         better="higher",
         full_intensity_at=0.15,
@@ -294,6 +319,7 @@ PAIRWISE_METRICS: Sequence[ComparisonMetric] = (
         "Pair active share",
         ("active_share",),
         "Pairwise",
+        "Weighted holding difference between the row and column portfolios. Lower values indicate more similar holdings.",
         "pct",
         better="lower",
         full_intensity_at=0.15,
@@ -303,6 +329,7 @@ PAIRWISE_METRICS: Sequence[ComparisonMetric] = (
         "Sector distance",
         ("sector_abs_distance",),
         "Pairwise",
+        "Total absolute difference between the pair's sector weights. Lower values indicate more similar sector exposure.",
         "pct",
         better="lower",
         full_intensity_at=0.05,
@@ -312,6 +339,7 @@ PAIRWISE_METRICS: Sequence[ComparisonMetric] = (
         "Sector similarity",
         ("sector_similarity",),
         "Pairwise",
+        "Similarity score between the pair's sector weights. Higher values indicate more similar sector exposure.",
         "number",
         better="higher",
         full_intensity_at=0.05,
@@ -321,6 +349,7 @@ PAIRWISE_METRICS: Sequence[ComparisonMetric] = (
         "Return correlation",
         ("returns", "correlation"),
         "Pairwise",
+        "Correlation between the pair's return series over the comparison window. Higher values indicate more similar returns.",
         "number",
         better="higher",
         full_intensity_at=0.10,
@@ -330,6 +359,7 @@ PAIRWISE_METRICS: Sequence[ComparisonMetric] = (
         "Pair tracking error",
         ("returns", "tracking_error"),
         "Pairwise",
+        "Annualized tracking-error distance between the pair's returns. Lower values indicate more similar returns.",
         "pct",
         better="lower",
         full_intensity_at=0.03,
@@ -337,12 +367,54 @@ PAIRWISE_METRICS: Sequence[ComparisonMetric] = (
 )
 
 PAIRWISE_HEATMAP_METRICS: Sequence[ComparisonMetric] = (
-    ComparisonMetric("weight_cosine_similarity", "Cosine similarity of weights", ("weight_cosine_similarity",), "Heatmap", "number"),
-    ComparisonMetric("active_share", "Active share distance", ("active_share",), "Heatmap", "pct"),
-    ComparisonMetric("tracking_error", "Tracking-error distance", ("returns", "tracking_error"), "Heatmap", "pct"),
-    ComparisonMetric("sector_abs_distance", "Sector exposure distance", ("sector_abs_distance",), "Heatmap", "pct"),
-    ComparisonMetric("factor_abs_distance", "Factor exposure distance", ("factor_abs_distance",), "Heatmap", "number"),
-    ComparisonMetric("tax_lot_action_overlap", "Tax-lot action overlap", ("tax_lot_action_overlap",), "Heatmap", "number"),
+    ComparisonMetric(
+        "weight_cosine_similarity",
+        "Cosine similarity of weights",
+        ("weight_cosine_similarity",),
+        "Heatmap",
+        "Cosine similarity between portfolio weight vectors. Higher values indicate more similar holdings.",
+        "number",
+    ),
+    ComparisonMetric(
+        "active_share",
+        "Active share distance",
+        ("active_share",),
+        "Heatmap",
+        "Pairwise active-share distance between portfolio holdings. Lower values indicate more similar holdings.",
+        "pct",
+    ),
+    ComparisonMetric(
+        "tracking_error",
+        "Tracking-error distance",
+        ("returns", "tracking_error"),
+        "Heatmap",
+        "Annualized tracking-error distance between portfolio return series. Lower values indicate more similar returns.",
+        "pct",
+    ),
+    ComparisonMetric(
+        "sector_abs_distance",
+        "Sector exposure distance",
+        ("sector_abs_distance",),
+        "Heatmap",
+        "Total absolute distance between portfolio sector weights. Lower values indicate more similar sector exposure.",
+        "pct",
+    ),
+    ComparisonMetric(
+        "factor_abs_distance",
+        "Factor exposure distance",
+        ("factor_abs_distance",),
+        "Heatmap",
+        "Total absolute distance between portfolio factor exposures. Lower values indicate more similar factor exposure.",
+        "number",
+    ),
+    ComparisonMetric(
+        "tax_lot_action_overlap",
+        "Tax-lot action overlap",
+        ("tax_lot_action_overlap",),
+        "Heatmap",
+        "Similarity of tax-lot action selections between portfolios when those diagnostics are available.",
+        "number",
+    ),
 )
 
 OBJECTIVE_COMPONENTS: Sequence[ObjectiveComponent] = (
@@ -547,6 +619,33 @@ tbody tr.group th {{
 tbody tr:last-child td, tbody tr:last-child th {{
   border-bottom: 0;
 }}
+tr[data-row-tooltip] {{
+  cursor: help;
+}}
+tr[data-row-tooltip]:focus {{
+  outline: 2px solid #315d8c;
+  outline-offset: -2px;
+}}
+.row-tooltip {{
+  position: fixed;
+  z-index: 1000;
+  max-width: min(520px, calc(100vw - 24px));
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: #17202a;
+  color: #ffffff;
+  box-shadow: 0 8px 24px rgba(23, 32, 42, 0.22);
+  font-size: 12px;
+  line-height: 1.35;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-3px);
+  transition: opacity 120ms ease, transform 120ms ease;
+}}
+.row-tooltip.is-visible {{
+  opacity: 1;
+  transform: translateY(-7px);
+}}
 .muted {{
   color: var(--muted);
 }}
@@ -650,13 +749,22 @@ svg.taxicab-viz {{ width: 100%; min-width: 640px; height: 380px; }}
   </div>
   {body}
 </main>
+<script>{row_tooltip_script}</script>
 </body>
 </html>
 """.format(
         benchmark=escape(benchmark),
         created=f" | Created: {escape(created_at)}" if created_at else "",
         body=body,
+        row_tooltip_script=_row_tooltip_script(),
     )
+
+
+def _row_tooltip_attrs(description: str) -> str:
+    text = " ".join(str(description).split())
+    if not text:
+        return ""
+    return f' data-row-tooltip="{escape(text, quote=True)}" tabindex="0"'
 
 
 def _render_summary_cards(comparison: Mapping[str, object], labels: Sequence[str]) -> str:
@@ -692,14 +800,18 @@ def _render_sources(comparison: Mapping[str, object]) -> str:
     if not sources:
         return ""
     rows = "\n".join(
-        "<tr><th>{}</th><td>{}</td></tr>".format(escape(str(label)), escape(str(path)))
+        "<tr{}><th>{}</th><td>{}</td></tr>".format(
+            _row_tooltip_attrs(f"Source for {label}: {path}"),
+            escape(str(label)),
+            escape(str(path)),
+        )
         for label, path in sources.items()
     )
     return f"""<section>
 <h2>Sources</h2>
 <div class="table-wrap">
 <table>
-<thead><tr><th>Portfolio</th><th>Path</th></tr></thead>
+<thead><tr{_row_tooltip_attrs("Sources table: portfolio labels and the input paths used in this comparison report.")}><th>Portfolio</th><th>Path</th></tr></thead>
 <tbody>
 {rows}
 </tbody>
@@ -727,7 +839,10 @@ def _render_metric_table(
     header = "".join(f"<th>{escape(label)}</th>" for label in labels)
     rows: List[str] = []
     for group, group_metrics in grouped.items():
-        rows.append(f'<tr class="group"><th colspan="{len(labels) + 1}">{escape(group)}</th></tr>')
+        rows.append(
+            f'<tr class="group"{_row_tooltip_attrs(f"Metric group: {group} in the {title} table.")}>'
+            f'<th colspan="{len(labels) + 1}">{escape(group)}</th></tr>'
+        )
         for metric in group_metrics:
             values = [_value_at(_mapping(portfolios.get(label)), metric.path) for label in labels]
             cells = []
@@ -737,12 +852,12 @@ def _render_metric_table(
             label = escape(metric.label)
             if metric.description:
                 label = f'<span class="metric-label" title="{escape(metric.description)}">{label}</span>'
-            rows.append(f"<tr><th>{label}</th>{''.join(cells)}</tr>")
+            rows.append(f"<tr{_row_tooltip_attrs(metric.description)}><th>{label}</th>{''.join(cells)}</tr>")
     return f"""<section>
 <h2>{escape(title)}</h2>
 <div class="table-wrap">
 <table>
-<thead><tr><th>Metric</th>{header}</tr></thead>
+<thead><tr{_row_tooltip_attrs(f"{title} table: each row is a metric and each portfolio column shows that metric's value.")}><th>Metric</th>{header}</tr></thead>
 <tbody>
 {''.join(rows)}
 </tbody>
@@ -776,12 +891,15 @@ def _render_sector_table(
         for value in values:
             style = _target_style(_numeric(value), values, target, full_intensity_at=0.02)
             cells.append(f"<td{style}>{escape(_format_percent(_numeric_or_zero(value)))}</td>")
-        rows.append(f"<tr><th>{escape(sector)}</th>{''.join(cells)}</tr>")
+        rows.append(
+            f"<tr{_row_tooltip_attrs(f'Sector weights for {sector}: index target and each portfolio exposure.')}>"
+            f"<th>{escape(sector)}</th>{''.join(cells)}</tr>"
+        )
     return f"""<section>
 <h2>Sector Weights</h2>
 <div class="table-wrap">
 <table>
-<thead><tr><th>Sector</th><th>Index</th>{header}</tr></thead>
+<thead><tr{_row_tooltip_attrs("Sector Weights table: compare the index target weight with each portfolio's sector exposure.")}><th>Sector</th><th>Index</th>{header}</tr></thead>
 <tbody>
 {''.join(rows)}
 </tbody>
@@ -908,7 +1026,7 @@ def _render_objective_waterfalls(portfolios: Mapping[str, object], labels: Seque
                 "</span></div></td>"
             )
         rows.append(
-            "<tr>"
+            f"<tr{_row_tooltip_attrs(component.description)}>"
             f"<th>{escape(component.label)}</th>"
             f"<td>{escape(component.unit)}</td>"
             f"<td class=\"muted\">{escape(component.description)}</td>"
@@ -919,7 +1037,7 @@ def _render_objective_waterfalls(portfolios: Mapping[str, object], labels: Seque
 <h2>Objective Decomposition</h2>
 <div class="table-wrap">
 <table class="objective-table">
-<thead><tr><th>Component</th><th>Unit</th><th>Description</th>{header}</tr></thead>
+<thead><tr{_row_tooltip_attrs("Objective Decomposition table: diagnostic objective components and their per-portfolio values.")}><th>Component</th><th>Unit</th><th>Description</th>{header}</tr></thead>
 <tbody>
 {''.join(rows)}
 </tbody>
@@ -1158,6 +1276,73 @@ def _json_script_payload(value: object) -> str:
     return escape(json.dumps(value, sort_keys=True), quote=False)
 
 
+def _row_tooltip_script() -> str:
+    return """
+(function(){
+const selector='tr[data-row-tooltip]';
+let tooltip=document.querySelector('.row-tooltip');
+if(!tooltip){
+  tooltip=document.createElement('div');
+  tooltip.className='row-tooltip';
+  tooltip.setAttribute('role','tooltip');
+  document.body.appendChild(tooltip);
+}
+let activeRow=null;
+function clamp(value,min,max){return Math.max(min,Math.min(max,value));}
+function place(row){
+  const text=row.dataset.rowTooltip||'';
+  if(!text){return;}
+  tooltip.textContent=text;
+  tooltip.classList.add('is-visible');
+  const rowRect=row.getBoundingClientRect();
+  const tipRect=tooltip.getBoundingClientRect();
+  const center=clamp(rowRect.left+rowRect.width/2,tipRect.width/2+12,window.innerWidth-tipRect.width/2-12);
+  let top=rowRect.top-tipRect.height-8;
+  if(top<8){top=rowRect.bottom+8;}
+  top=clamp(top,8,window.innerHeight-tipRect.height-8);
+  tooltip.style.left=`${center-tipRect.width/2}px`;
+  tooltip.style.top=`${top}px`;
+}
+function show(row){
+  activeRow=row;
+  tooltip.textContent=row.dataset.rowTooltip||'';
+  tooltip.style.left='0px';
+  tooltip.style.top='0px';
+  tooltip.classList.add('is-visible');
+  requestAnimationFrame(()=>place(row));
+}
+function hide(row){
+  if(row&&activeRow!==row){return;}
+  activeRow=null;
+  tooltip.classList.remove('is-visible');
+}
+function handleEnter(event){
+  const row=event.target.closest(selector);
+  if(row){show(row);}
+}
+function handleLeave(event){
+  const row=event.target.closest(selector);
+  if(!row){return;}
+  if(event.relatedTarget&&row.contains(event.relatedTarget)){return;}
+  hide(row);
+}
+document.addEventListener('pointerover',handleEnter);
+document.addEventListener('mouseover',handleEnter);
+document.addEventListener('pointerout',handleLeave);
+document.addEventListener('mouseout',handleLeave);
+document.addEventListener('focusin',event=>{
+  const row=event.target.closest(selector);
+  if(row){show(row);}
+});
+document.addEventListener('focusout',event=>{
+  const row=event.target.closest(selector);
+  if(row){hide(row);}
+});
+window.addEventListener('scroll',()=>{if(activeRow){place(activeRow);}}, {passive:true});
+window.addEventListener('resize',()=>{if(activeRow){place(activeRow);}});
+})();"""
+
+
 def _heatmap_script() -> str:
     return """
 (function(){
@@ -1207,7 +1392,8 @@ def _pairwise_table_script() -> str:
 (function(){
 const data=JSON.parse(document.getElementById('pairwise-table-data').textContent),select=document.getElementById('pairwise-metric'),thead=document.getElementById('pairwise-metric-head'),tbody=document.getElementById('pairwise-metric-body'),note=document.getElementById('pairwise-metric-note');
 Object.entries(data.metrics).forEach(([key,metric])=>{const option=document.createElement('option');option.value=key;option.textContent=metric.label;select.appendChild(option);});
-function draw(){const metric=data.metrics[select.value];thead.innerHTML='';tbody.innerHTML='';note.textContent=metric.description||'';const headRow=document.createElement('tr'),corner=document.createElement('th');corner.textContent=metric.label;headRow.appendChild(corner);data.labels.forEach(label=>{const th=document.createElement('th');th.textContent=label;headRow.appendChild(th);});thead.appendChild(headRow);metric.rows.forEach(row=>{const tr=document.createElement('tr'),label=document.createElement('th');label.textContent=row.label;tr.appendChild(label);row.cells.forEach(cell=>{const td=document.createElement('td');td.textContent=cell.display;if(cell.background){td.style.backgroundColor=cell.background;}if(cell.self){td.className='pairwise-self';}tr.appendChild(td);});tbody.appendChild(tr);});}
+function setRowTooltip(row,text){if(!text){return;}row.dataset.rowTooltip=text;row.tabIndex=0;}
+function draw(){const metric=data.metrics[select.value];thead.innerHTML='';tbody.innerHTML='';note.textContent=metric.description||'';const headRow=document.createElement('tr'),corner=document.createElement('th'),description=metric.description||metric.label;setRowTooltip(headRow,`${metric.label}: row portfolios are compared against column portfolios.`);corner.textContent=metric.label;headRow.appendChild(corner);data.labels.forEach(label=>{const th=document.createElement('th');th.textContent=label;headRow.appendChild(th);});thead.appendChild(headRow);metric.rows.forEach(row=>{const tr=document.createElement('tr'),label=document.createElement('th');setRowTooltip(tr,`${row.label}: ${description}`);label.textContent=row.label;tr.appendChild(label);row.cells.forEach(cell=>{const td=document.createElement('td');td.textContent=cell.display;if(cell.background){td.style.backgroundColor=cell.background;}if(cell.self){td.className='pairwise-self';}tr.appendChild(td);});tbody.appendChild(tr);});}
 select.addEventListener('change',draw);draw();
 })();"""
 
