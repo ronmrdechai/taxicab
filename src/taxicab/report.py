@@ -108,6 +108,16 @@ PORTFOLIO_METRICS: Sequence[ComparisonMetric] = (
         full_intensity_at=0.15,
     ),
     ComparisonMetric(
+        "estimated_tax_alpha",
+        "Estimated tax alpha",
+        ("features", "simulated_tax_alpha"),
+        "Tax metrics",
+        "pct",
+        better="higher",
+        full_intensity_at=0.02,
+        description="Construction-time optimizer estimate, distinct from harvest replay results.",
+    ),
+    ComparisonMetric(
         "sector_active_share_to_index",
         "Sector active share",
         ("sector_active_share_to_index",),

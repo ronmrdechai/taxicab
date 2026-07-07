@@ -264,7 +264,12 @@ class CliTests(unittest.TestCase):
             }
             write_cache(data_dir, holdings, prices, {"index": "IDX"})
             left.write_text(
-                json.dumps({"positions": [{"ticker": "AAA", "weight": 1.0, "sector": "Tech"}]}),
+                json.dumps(
+                    {
+                        "metrics": {"simulated_tax_alpha": 0.0123},
+                        "positions": [{"ticker": "AAA", "weight": 1.0, "sector": "Tech"}],
+                    }
+                ),
                 encoding="utf-8",
             )
             right.write_text(
@@ -292,6 +297,8 @@ class CliTests(unittest.TestCase):
             report = html_output.read_text(encoding="utf-8")
             self.assertIn("<title>Taxicab Comparison Report</title>", report)
             self.assertIn("Portfolio Metrics", report)
+            self.assertIn("Estimated tax alpha", report)
+            self.assertIn("1.23%", report)
             self.assertIn("Sector Weights", report)
             self.assertIn("Pairwise Similarity Heatmap", report)
             self.assertIn("Feature-Space PCA Embedding", report)
