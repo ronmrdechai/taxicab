@@ -22,6 +22,7 @@ from taxicab.optimizer import (
     project_to_bounded_simplex,
     project_to_simplex,
     project_to_simplex_with_floor,
+    random_unbiased_selection,
     replacement_candidates,
     simulate_portfolio_harvests,
     save_tracking_model_artifact,
@@ -176,6 +177,34 @@ class OptimizerTests(unittest.TestCase):
         self.assertAlmostEqual(weights[0], 0.60, places=9)
         self.assertAlmostEqual(weights[1], 0.30, places=9)
         self.assertAlmostEqual(weights[2], 0.10, places=9)
+
+    def test_random_unbiased_selection_uses_inclusion_probability_weights(self):
+        candidates = [
+            Candidate("MEGA", 0.60, "Tech", beta=1.0, tax_alpha=0.0),
+            Candidate("LARGE", 0.20, "Tech", beta=1.0, tax_alpha=0.0),
+            Candidate("MID", 0.10, "Tech", beta=1.0, tax_alpha=0.0),
+            Candidate("SMALL1", 0.05, "Tech", beta=1.0, tax_alpha=0.0),
+            Candidate("SMALL2", 0.05, "Tech", beta=1.0, tax_alpha=0.0),
+        ]
+
+        selection = random_unbiased_selection(candidates, sample_size=3, random_seed=5)
+        selected_weights = {
+            candidate.ticker: weight
+            for candidate, weight in zip(selection.selected, selection.weights)
+        }
+
+        self.assertEqual(len(selection.selected), 3)
+        self.assertAlmostEqual(sum(selection.weights), 1.0, places=9)
+        self.assertAlmostEqual(selected_weights["MEGA"], 0.60, places=9)
+        self.assertAlmostEqual(selected_weights["LARGE"], 0.20, places=9)
+        self.assertAlmostEqual(
+            selected_weights[[ticker for ticker in selected_weights if ticker not in {"MEGA", "LARGE"}][0]],
+            0.20,
+            places=9,
+        )
+        self.assertEqual(selection.inclusion_probabilities["MEGA"], 1.0)
+        self.assertEqual(selection.inclusion_probabilities["LARGE"], 1.0)
+        self.assertEqual(selection.diagnostics["selection_weighting"], "random_unbiased_pps")
 
     def test_beam_selection_is_deterministic_and_can_match_sector_quotas(self):
         benchmark_returns = returns([0.01, -0.01, 0.02, -0.02, 0.015, -0.015] * 4)
@@ -347,6 +376,43 @@ class OptimizerTests(unittest.TestCase):
             1.0,
             places=9,
         )
+
+    def test_construct_portfolio_supports_random_unbiased_baseline(self):
+        benchmark_returns = returns([0.01, -0.01, 0.02, -0.02, 0.015, -0.015] * 4)
+        holdings = [
+            Holding("A", 0.60, "Tech"),
+            Holding("B", 0.20, "Tech"),
+            Holding("C", 0.10, "Health"),
+            Holding("D", 0.05, "Health"),
+            Holding("E", 0.05, "Health"),
+        ]
+        candidates = [
+            Candidate(holding.ticker, holding.weight, holding.sector, beta=1.0, tax_alpha=0.03, returns=benchmark_returns)
+            for holding in holdings
+        ]
+
+        portfolio = construct_portfolio(
+            candidates,
+            holdings,
+            sample_size=3,
+            error_margin=0.05,
+            target_tax_alpha=0.03,
+            rebalance_frequency="quarterly",
+            benchmark_returns=benchmark_returns,
+            selection_method="random-unbiased",
+            random_seed=13,
+            allow_constraint_violations=True,
+        )
+
+        targets = object_map(portfolio["targets"])
+        metrics = object_map(portfolio["metrics"])
+        positions = object_list(portfolio["positions"])
+        self.assertEqual(targets["selection_method"], "random-unbiased")
+        self.assertEqual(targets["weight_method"], "random-unbiased")
+        self.assertEqual(targets["requested_weight_method"], "slsqp")
+        self.assertEqual(metrics["selection_weighting"], "random_unbiased_pps")
+        self.assertAlmostEqual(sum(number(position["weight"]) for position in positions), 1.0, places=9)
+        self.assertTrue(all("sample_inclusion_probability" in position for position in positions))
 
     @unittest.skipUnless(HAS_PYSCIPOPT, "PySCIPOpt is not installed")
     def test_construct_portfolio_supports_miqp_selection_method(self):

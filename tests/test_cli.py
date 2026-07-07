@@ -139,6 +139,63 @@ class CliTests(unittest.TestCase):
             self.assertTrue(state["targets"]["allow_constraint_violations"])
             self.assertEqual(state["portfolio_harvest_simulation"]["replacement_method"], "random")
 
+    def test_construct_command_accepts_random_unbiased_strategy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "cache"
+            output = Path(tmp) / "portfolio.json"
+            benchmark_returns = [0.01, -0.01, 0.02, -0.02, 0.01, -0.01]
+            holdings = [
+                Holding("AAA", 0.60, "Tech"),
+                Holding("BBB", 0.20, "Tech"),
+                Holding("CCC", 0.10, "Health"),
+                Holding("DDD", 0.05, "Health"),
+                Holding("EEE", 0.05, "Health"),
+            ]
+            prices = {
+                "IDX": price_series(100.0, benchmark_returns),
+                "AAA": price_series(50.0, benchmark_returns),
+                "BBB": price_series(80.0, [item * 1.1 for item in benchmark_returns]),
+                "CCC": price_series(70.0, [item * 0.9 for item in benchmark_returns]),
+                "DDD": price_series(60.0, [item * 1.05 for item in benchmark_returns]),
+                "EEE": price_series(40.0, [item * 0.95 for item in benchmark_returns]),
+            }
+            write_cache(data_dir, holdings, prices, {"index": "IDX"})
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                status = main(
+                    [
+                        "construct",
+                        "--data-dir",
+                        str(data_dir),
+                        "--sample-size",
+                        "3",
+                        "--error-margin",
+                        "0.05",
+                        "--target-tax-alpha",
+                        "0.03",
+                        "--rebalance-frequency",
+                        "monthly",
+                        "--min-observations",
+                        "5",
+                        "--selection-method",
+                        "random-unbiased",
+                        "--replacement-method",
+                        "random",
+                        "--allow-constraint-violations",
+                        "--seed",
+                        "19",
+                        "--output",
+                        str(output),
+                    ]
+                )
+
+            self.assertEqual(status, 0)
+            state = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(state["targets"]["selection_method"], "random-unbiased")
+            self.assertEqual(state["targets"]["weight_method"], "random-unbiased")
+            self.assertEqual(state["targets"]["requested_weight_method"], "slsqp")
+            self.assertEqual(state["portfolio_harvest_simulation"]["replacement_method"], "random")
+
     def test_compare_command_writes_similarity_report(self):
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "cache"

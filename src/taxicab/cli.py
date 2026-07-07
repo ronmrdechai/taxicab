@@ -150,7 +150,7 @@ def add_construct_arguments(
     parser.add_argument("--min-observations", type=int, default=252, help="Minimum daily overlap with benchmark.")
     parser.add_argument(
         "--selection-method",
-        choices=["optimized", "random-weighted", "greedy", "beam", "miqp"],
+        choices=["optimized", "random-weighted", "random-unbiased", "greedy", "beam", "miqp"],
         default="optimized",
         help="Selection backend. Default: optimized.",
     )

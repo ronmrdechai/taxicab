@@ -25,7 +25,7 @@ from .metrics import (
 )
 
 
-SELECTION_METHODS = {"optimized", "random-weighted", "greedy", "beam", "miqp"}
+SELECTION_METHODS = {"optimized", "random-weighted", "random-unbiased", "greedy", "beam", "miqp"}
 WEIGHT_METHODS = {"slsqp", "index-normalized"}
 REPLACEMENT_METHODS = {"ranked", "random"}
 
@@ -42,6 +42,14 @@ class Candidate:
     observations: int = 0
     returns: Optional[Dict[date, float]] = None
     industry: str = "Unknown"
+
+
+@dataclass(frozen=True)
+class RandomUnbiasedSelection:
+    selected: List[Candidate]
+    weights: List[float]
+    inclusion_probabilities: Dict[str, float]
+    diagnostics: Dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -789,6 +797,186 @@ def _weighted_sample_without_replacement(
     probabilities = weights / total_weight if total_weight > 0 else None
     indices = rng.choice(len(candidates), size=sample_size, replace=False, p=probabilities)
     return [candidates[int(index)] for index in indices]
+
+
+def _systematic_pps_positions(
+    inclusion_probabilities: np.ndarray,
+    sample_size: int,
+    rng: np.random.Generator,
+) -> List[int]:
+    if sample_size <= 0:
+        return []
+    if len(inclusion_probabilities) < sample_size:
+        raise ValueError(
+            f"only {len(inclusion_probabilities)} residual candidates available for sample size {sample_size}"
+        )
+    order = rng.permutation(len(inclusion_probabilities))
+    ordered_probabilities = inclusion_probabilities[order]
+    cumulative = np.cumsum(ordered_probabilities)
+    if len(cumulative) == 0 or float(cumulative[-1]) <= 0:
+        raise ValueError("positive index weights are required for random-unbiased selection")
+    thresholds = float(rng.random()) + np.arange(sample_size, dtype=float)
+    positions = np.searchsorted(cumulative, thresholds, side="left")
+    positions = np.minimum(positions, len(order) - 1)
+    selected = [int(order[int(position)]) for position in positions]
+    if len(set(selected)) != sample_size:
+        raise ValueError("random-unbiased sampling produced duplicate residual selections")
+    return selected
+
+
+def _random_unbiased_group_selection(
+    candidates: Sequence[Candidate],
+    sample_size: int,
+    target_weight: float,
+    rng: np.random.Generator,
+) -> RandomUnbiasedSelection:
+    if sample_size <= 0:
+        raise ValueError("sample_size must be positive")
+    if len(candidates) < sample_size:
+        raise ValueError(f"only {len(candidates)} candidates available for sample size {sample_size}")
+    if target_weight < 0:
+        raise ValueError("target weight must be nonnegative")
+    raw_weights = np.asarray([max(0.0, candidate.index_weight) for candidate in candidates], dtype=float)
+    raw_total = float(np.sum(raw_weights))
+    if raw_total <= 0:
+        target_weights = np.full(len(candidates), target_weight / len(candidates), dtype=float)
+    else:
+        target_weights = raw_weights / raw_total * target_weight
+
+    remaining = np.arange(len(candidates), dtype=int)
+    slots = sample_size
+    selected_indices: List[int] = []
+    selected_weights: List[float] = []
+    inclusion_probabilities: Dict[str, float] = {}
+    certainty_count = 0
+    residual_weight = 0.0
+
+    while slots > 0:
+        if len(remaining) < slots:
+            raise ValueError(
+                f"only {len(remaining)} residual candidates available for {slots} random-unbiased slots"
+            )
+        remaining_weight = float(np.sum(target_weights[remaining]))
+        if remaining_weight <= 0:
+            raise ValueError("positive index weights are required for random-unbiased selection")
+        if len(remaining) == slots:
+            for idx in remaining:
+                index = int(idx)
+                selected_indices.append(index)
+                selected_weights.append(float(target_weights[index]))
+                inclusion_probabilities[candidates[index].ticker] = 1.0
+            certainty_count += slots
+            slots = 0
+            break
+
+        probabilities = slots * target_weights[remaining] / remaining_weight
+        certainty_mask = probabilities >= 1.0 - 1e-12
+        if not bool(np.any(certainty_mask)):
+            residual_weight = remaining_weight / slots
+            positions = _systematic_pps_positions(probabilities, slots, rng)
+            for position in positions:
+                index = int(remaining[position])
+                selected_indices.append(index)
+                selected_weights.append(float(residual_weight))
+                inclusion_probabilities[candidates[index].ticker] = float(probabilities[position])
+            break
+
+        certainty_positions = remaining[certainty_mask]
+        for idx in certainty_positions:
+            index = int(idx)
+            selected_indices.append(index)
+            selected_weights.append(float(target_weights[index]))
+            inclusion_probabilities[candidates[index].ticker] = 1.0
+        certainty_count += int(len(certainty_positions))
+        slots -= int(len(certainty_positions))
+        remaining = remaining[~certainty_mask]
+
+    selected = [candidates[index] for index in selected_indices]
+    diagnostics: Dict[str, object] = {
+        "selection_weighting": "random_unbiased_pps",
+        "random_unbiased_certainty_count": certainty_count,
+        "random_unbiased_random_count": sample_size - certainty_count,
+        "random_unbiased_target_weight": target_weight,
+        "random_unbiased_residual_weight": residual_weight,
+    }
+    return RandomUnbiasedSelection(selected, selected_weights, inclusion_probabilities, diagnostics)
+
+
+def random_unbiased_selection(
+    candidates: Sequence[Candidate],
+    sample_size: int,
+    random_seed: int = 7,
+    match_sectors: bool = False,
+    target_sectors: Optional[Dict[str, float]] = None,
+) -> RandomUnbiasedSelection:
+    rng = np.random.default_rng(random_seed)
+    if not match_sectors or not target_sectors:
+        return _random_unbiased_group_selection(candidates, sample_size, 1.0, rng)
+
+    by_sector: Dict[str, List[Candidate]] = {}
+    for candidate in candidates:
+        by_sector.setdefault(candidate.sector, []).append(candidate)
+    available_target_sectors = {
+        sector: weight
+        for sector, weight in target_sectors.items()
+        if weight > 0 and by_sector.get(sector)
+    }
+    available_target_total = sum(available_target_sectors.values())
+    if available_target_total <= 0:
+        raise ValueError("random-unbiased sector matching requires at least one target sector with candidates")
+    dropped_target_weight = sum(
+        weight
+        for sector, weight in target_sectors.items()
+        if weight > 0 and not by_sector.get(sector)
+    )
+    sector_targets_for_sampling = {
+        sector: weight / available_target_total
+        for sector, weight in available_target_sectors.items()
+    }
+
+    selected: List[Candidate] = []
+    weights: List[float] = []
+    inclusion_probabilities: Dict[str, float] = {}
+    quotas = _sector_quotas(sector_targets_for_sampling, sample_size)
+    certainty_count = 0
+    random_count = 0
+    for sector, quota in sorted(
+        quotas.items(),
+        key=lambda item: sector_targets_for_sampling.get(item[0], 0.0),
+        reverse=True,
+    ):
+        if quota <= 0:
+            continue
+        sector_weight = float(sector_targets_for_sampling.get(sector, 0.0))
+        if sector_weight <= 0:
+            continue
+        pool = by_sector.get(sector, [])
+        if len(pool) < quota:
+            raise ValueError(
+                f"sector {sector} has only {len(pool)} candidates for random-unbiased quota {quota}"
+            )
+        sector_selection = _random_unbiased_group_selection(pool, quota, sector_weight, rng)
+        selected.extend(sector_selection.selected)
+        weights.extend(sector_selection.weights)
+        inclusion_probabilities.update(sector_selection.inclusion_probabilities)
+        certainty_count += int(sector_selection.diagnostics["random_unbiased_certainty_count"])
+        random_count += int(sector_selection.diagnostics["random_unbiased_random_count"])
+
+    if len(selected) != sample_size:
+        raise ValueError(
+            f"random-unbiased sector quotas selected {len(selected)} candidates for sample size {sample_size}"
+        )
+    return RandomUnbiasedSelection(
+        selected,
+        weights,
+        inclusion_probabilities,
+        {
+            "selection_weighting": "random_unbiased_pps_sector_matched",
+            "random_unbiased_certainty_count": certainty_count,
+            "random_unbiased_random_count": random_count,
+            "random_unbiased_dropped_sector_target_weight": dropped_target_weight,
+        },
+    )
 
 
 def random_weighted_selection(
@@ -3287,7 +3475,7 @@ def construct_portfolio(
     if benchmark_returns is None:
         raise ValueError("benchmark_returns are required to optimize error margin")
     if selection_method not in SELECTION_METHODS:
-        raise ValueError("selection_method must be optimized, random-weighted, greedy, beam, or miqp")
+        raise ValueError("selection_method must be optimized, random-weighted, random-unbiased, greedy, beam, or miqp")
     if weight_method not in WEIGHT_METHODS:
         raise ValueError("weight_method must be slsqp or index-normalized")
     if replacement_method not in REPLACEMENT_METHODS:
@@ -3298,6 +3486,9 @@ def construct_portfolio(
     targets = sector_targets(holdings) if match_sectors else None
     tracking_cache = _TrackingArrayCache(candidates, construction_benchmark_returns)
     selection_diagnostics: Dict[str, object] = {}
+    sample_inclusion_probabilities: Dict[str, float] = {}
+    random_unbiased_weights: Optional[List[float]] = None
+    actual_weight_method = weight_method
     if selection_method == "optimized":
         initial = initial_selection(
             candidates,
@@ -3335,6 +3526,19 @@ def construct_portfolio(
             match_sectors=match_sectors,
             target_sectors=targets,
         )
+    elif selection_method == "random-unbiased":
+        unbiased_selection = random_unbiased_selection(
+            candidates,
+            sample_size,
+            random_seed=random_seed,
+            match_sectors=match_sectors,
+            target_sectors=targets,
+        )
+        selected = unbiased_selection.selected
+        random_unbiased_weights = unbiased_selection.weights
+        sample_inclusion_probabilities = unbiased_selection.inclusion_probabilities
+        selection_diagnostics = dict(unbiased_selection.diagnostics)
+        actual_weight_method = "random-unbiased"
     elif selection_method == "miqp":
         selected, selection_diagnostics = miqp_selection(
             candidates,
@@ -3365,7 +3569,19 @@ def construct_portfolio(
             beam_width=1 if selection_method == "greedy" else beam_width,
             tracking_cache=tracking_cache,
         )
-    if weight_method == "slsqp":
+    if random_unbiased_weights is not None:
+        weights = random_unbiased_weights
+        if min_weight > 0 and any(0.0 < weight < min_weight - 1e-12 for weight in weights):
+            raise ValueError(
+                "random-unbiased weights cannot satisfy min_weight without introducing bias; "
+                "lower --min-weight or use another selection method"
+            )
+        if max_weight is not None and any(weight > max_weight + 1e-12 for weight in weights):
+            raise ValueError(
+                "random-unbiased weights cannot satisfy max_weight without introducing bias; "
+                "raise --max-weight or use another selection method"
+            )
+    elif weight_method == "slsqp":
         weights = optimize_weights(
             selected,
             construction_error_margin,
@@ -3416,6 +3632,11 @@ def construct_portfolio(
                 "sector": candidate.sector,
                 "industry": candidate.industry,
                 "index_weight": candidate.index_weight,
+                **(
+                    {"sample_inclusion_probability": sample_inclusion_probabilities[candidate.ticker]}
+                    if candidate.ticker in sample_inclusion_probabilities
+                    else {}
+                ),
                 "beta": candidate.beta,
                 "tax_alpha": candidate.tax_alpha,
                 "simulated_tax_alpha": candidate.simulated_tax_alpha,
@@ -3440,7 +3661,12 @@ def construct_portfolio(
             "tracking_error_penalty": tracking_error_penalty,
             "index_anchor_penalty": index_anchor_penalty,
             "selection_method": selection_method,
-            "weight_method": weight_method,
+            "weight_method": actual_weight_method,
+            **(
+                {"requested_weight_method": weight_method}
+                if actual_weight_method != weight_method
+                else {}
+            ),
             "beam_width": beam_width,
             "miqp_time_limit": miqp_time_limit,
             "miqp_gap": miqp_gap,

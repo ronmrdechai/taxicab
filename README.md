@@ -172,7 +172,8 @@ The selected portfolio minimizes tracking error against the requested error marg
 Construction can also run alternate backends for benchmarking:
 
 - `--selection-method optimized` keeps the default random local-search selection.
-- `--selection-method random-weighted` samples stocks without replacement using index weights as sampling probabilities.
+- `--selection-method random-weighted` samples stocks without replacement using index weights as sampling probabilities. This is a legacy comparison baseline: paired with `--weight-method index-normalized`, it overweights selected large-cap names because the omitted tail is redistributed across the selected names.
+- `--selection-method random-unbiased` uses probability-proportional-to-size sampling with certainty names and inverse-inclusion-probability weights, so the sampled portfolio equals the index in expectation. With `--sector-match`, it applies the same design inside each sector quota. This method uses its own `random-unbiased` weights rather than a separate weight optimizer.
 - `--selection-method greedy` uses deterministic beam search with width 1.
 - `--selection-method beam --beam-width N` keeps the best deterministic candidate portfolios at each selection step.
 - `--selection-method miqp` uses PySCIPOpt to solve a mixed-integer quadratic selection model with binary inclusion variables and continuous weights.
